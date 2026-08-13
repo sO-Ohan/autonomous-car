@@ -213,6 +213,20 @@ static int   TAKEUP = 90;          // counts to run past -- must exceed the ~35
 
 // Runaway guard: an unstable gain must never be able to spin a wheel up.
 static float VEL_LIMIT = 18000.0f; // counts/s, above the measured 16089 top speed
+
+// ---- robot geometry ----
+// Wheel diameter 119.56 mm -> circumference 375.61 mm, and 4096 counts is one
+// wheel revolution, giving 10905 counts/m. That is the theoretical value only:
+// tyre compression and slip typically put the real figure a few percent off,
+// so correct it with a measured run via CALDIST. If the encoder turns out to
+// sit before a gear reduction, CALDIST absorbs that too.
+static float CPM = 10905.0f;       // counts per metre
+static float TRACK_MM = 0.0f;      // wheel centre-to-centre, MUST be measured
+
+// Pose, integrated from both encoders. Standard differential-drive odometry.
+static double poseX = 0, poseY = 0, poseTh = 0;
+static int64_t lastPoseL = 0, lastPoseR = 0;
+static float lastDriveM = 0;       // last commanded distance, for CALDIST
 static bool  telem = false;
 
 // ---- move trace ----
@@ -733,10 +747,9 @@ static Wheel *pickWheel(const String &s) {
   return nullptr;
 }
 
-static void moveBy(Wheel &w, float degrees) {
-  int64_t tgt = w.pos + (int64_t)lroundf(degrees * CPR / 360.0f);
+static void moveCounts(Wheel &w, int64_t delta) {
+  int64_t tgt = w.pos + delta;
   w.finalTarget = tgt;
-  int64_t delta = tgt - w.pos;
 
   if (traceArmed) {                 // record this move at the full loop rate
     traceW = &w;
@@ -755,7 +768,60 @@ static void moveBy(Wheel &w, float degrees) {
     w.approachStage = 0;
     startMove(w, tgt);
   }
-  Serial.printf("ACK,move,%s,%.2f\n", w.name, degrees);
+  Serial.printf("ACK,move,%s,%.2f\n", w.name, delta * 360.0f / CPR);
+}
+
+static void moveBy(Wheel &w, float degrees) {
+  moveCounts(w, (int64_t)lroundf(degrees * CPR / 360.0f));
+}
+
+// ---- differential drive ----
+// Straight line: both wheels the same distance. The measured 5% speed
+// difference between them is handled by each wheel's own feedforward slope,
+// so equal targets really do produce a straight line.
+static void driveMetres(float m) {
+  lastDriveM = m;
+  int64_t c = (int64_t)lroundf(m * CPM);
+  moveCounts(WL, c);
+  moveCounts(WR, c);
+  Serial.printf("ACK,drive,%.4f,%lld\n", m, (long long)c);
+}
+
+// Turn in place: the wheels counter-rotate along a circle of diameter TRACK,
+// so each travels (TRACK/2) * theta. Positive is counter-clockwise seen from
+// above: left wheel back, right wheel forward.
+static bool turnDegrees(float deg) {
+  if (TRACK_MM <= 0) {
+    Serial.println(F("ERR,track,set TRACK <mm> first -- a turn cannot be computed without it"));
+    return false;
+  }
+  float arc = (TRACK_MM / 2000.0f) * deg * (float)M_PI / 180.0f;   // metres
+  int64_t c = (int64_t)lroundf(arc * CPM);
+  moveCounts(WL, -c);
+  moveCounts(WR, +c);
+  Serial.printf("ACK,turn,%.2f,%lld\n", deg, (long long)c);
+  return true;
+}
+
+static void updatePose() {
+  if (TRACK_MM <= 0) { lastPoseL = WL.pos; lastPoseR = WR.pos; return; }
+  double dl = (WL.pos - lastPoseL) / (double)CPM;
+  double dr = (WR.pos - lastPoseR) / (double)CPM;
+  lastPoseL = WL.pos;
+  lastPoseR = WR.pos;
+  if (dl == 0 && dr == 0) return;
+  double dc = (dl + dr) / 2.0;
+  double dth = (dr - dl) / (TRACK_MM / 1000.0);
+  poseX += dc * cos(poseTh + dth / 2.0);
+  poseY += dc * sin(poseTh + dth / 2.0);
+  poseTh += dth;
+}
+
+static void geomSave() {
+  prefs.begin("drive", false);
+  prefs.putFloat("cpm", CPM);
+  prefs.putFloat("track", TRACK_MM);
+  prefs.end();
 }
 
 static void handleLine(String line) {
@@ -830,6 +896,39 @@ static void handleLine(String line) {
       Serial.println();
     }
     Serial.println(F("TRCEND"));
+  } else if (cmd == "DRIVE" && n >= 2) {      // DRIVE <metres>
+    driveMetres(tok[1].toFloat());
+  } else if (cmd == "TURN" && n >= 2) {       // TURN <degrees, +ve = CCW>
+    turnDegrees(tok[1].toFloat());
+  } else if (cmd == "POSE") {
+    Serial.printf("POSE,%.4f,%.4f,%.2f,%.4f,%.4f\n", poseX, poseY,
+                  poseTh * 180.0 / M_PI, WL.pos / (double)CPM, WR.pos / (double)CPM);
+  } else if (cmd == "POSERST") {
+    poseX = poseY = poseTh = 0;
+    lastPoseL = WL.pos;
+    lastPoseR = WR.pos;
+    Serial.println(F("ACK,posrst"));
+  } else if (cmd == "CPM" && n >= 2) {
+    CPM = tok[1].toFloat();
+    geomSave();
+    Serial.printf("ACK,cpm,%.1f\n", CPM);
+  } else if (cmd == "TRACK" && n >= 2) {
+    TRACK_MM = tok[1].toFloat();
+    geomSave();
+    Serial.printf("ACK,track,%.1f\n", TRACK_MM);
+  } else if (cmd == "CALDIST" && n >= 2) {    // CALDIST <actual metres travelled>
+    float actual = tok[1].toFloat();
+    if (lastDriveM != 0 && actual > 0) {
+      float old = CPM;
+      CPM = CPM * (lastDriveM / actual);      // travelled too far -> fewer counts/m
+      geomSave();
+      Serial.printf("ACK,caldist,%.1f,%.1f,%.2f\n", old, CPM,
+                    (CPM - old) / old * 100.0f);
+    } else {
+      Serial.println(F("ERR,caldist,run DRIVE <m> first, then pass the measured distance"));
+    }
+  } else if (cmd == "GEOM") {
+    Serial.printf("GEOM,%.1f,%.1f,%.4f\n", CPM, TRACK_MM, lastDriveM);
   } else if (cmd == "CALQ") {                 // report calibration state on demand
     Serial.printf("CALLOAD,L,%d,%d,%d,%.2f\n",
                   (WL.minDutyFwd > 0 && WL.minDutyRev > 0) ? 1 : 0,
@@ -872,6 +971,14 @@ void setup() {
   Serial.println(F("\n\n########## DRIVE HARNESS ##########"));
   Serial.println(F("Motor rail live, EN strapped to VCC -- drivers always enabled."));
 
+  prefs.begin("drive", true);
+  CPM = prefs.getFloat("cpm", CPM);
+  TRACK_MM = prefs.getFloat("track", 0.0f);
+  prefs.end();
+  Serial.printf("GEOM,%.1f,%.1f,0.0\n", CPM, TRACK_MM);
+  if (TRACK_MM <= 0)
+    Serial.println(F("WARNING: TRACK not set -- TURN and pose are unavailable. Use: TRACK <mm>"));
+
   bool cl = calLoad(WL), cr = calLoad(WR);
   Serial.printf("CALLOAD,L,%d,%d,%d,%.2f\n", cl ? 1 : 0, WL.minDutyFwd, WL.minDutyRev, WL.slope);
   Serial.printf("CALLOAD,R,%d,%d,%d,%.2f\n", cr ? 1 : 0, WR.minDutyFwd, WR.minDutyRev, WR.slope);
@@ -901,6 +1008,8 @@ void loop() {
     updateWheel(WR, dt);
     controlWheel(WL, dt);
     controlWheel(WR, dt);
+
+    updatePose();
 
     if (traceW && traceCount < TRACE_N)
       traceBuf[traceCount++] = (int32_t)(traceW->pos - traceStart);

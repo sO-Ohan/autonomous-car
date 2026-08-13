@@ -66,17 +66,48 @@ pio run -t upload
 On boot it runs the full check sequence, then accepts line commands and runs a
 200 Hz control loop.
 
+**Robot motion**
+
+| Command | Action |
+|---|---|
+| `DRIVE <metres>` | both wheels straight, signed |
+| `TURN <degrees>` | turn in place, +ve counter-clockwise (needs `TRACK`) |
+| `POSE` | `POSE,x,y,heading°,leftMetres,rightMetres` |
+| `POSERST` | zero the pose |
+
+**Per-wheel motion**
+
 | Command | Action |
 |---|---|
 | `P <L\|R> <deg>` | closed-loop relative rotation |
 | `PB <deg>` | same move on both wheels |
 | `D <L\|R> <-255..255>` | open-loop duty |
 | `V <L\|R> <counts/s>` | velocity control |
-| `C <L\|R>` | calibrate — measures deadband and duty→speed slope |
-| `K <kp> <ki> <kd>` | set PID gains live |
-| `TOL <counts>` | set settling tolerance |
+
+**Calibration and geometry**
+
+| Command | Action |
+|---|---|
+| `C <L\|R>` | calibrate — measures deadband and duty→speed slope, saves to NVS |
+| `CALQ` / `CALCLR` | report / erase stored calibration |
+| `TRACK <mm>` | wheel centre-to-centre. Required for `TURN` and pose |
+| `CPM <counts>` | counts per metre (default 10905 from a 119.56 mm wheel) |
+| `CALDIST <actual m>` | after a `DRIVE`, give the tape-measured distance to correct `CPM` |
+| `GEOM` | report `CPM`, `TRACK`, last commanded distance |
+
+**Tuning and diagnostics**
+
+| Command | Action |
+|---|---|
+| `K <kp> <ki> <kd> [kv]` | PID gains; `kv` clamped to 0.070 |
+| `TOL <counts>` | settling tolerance |
+| `PROF <vmax> <amax>` | profile limits, counts/s and counts/s² |
+| `APPROACH <0\|1\|-1> <takeup>` | backlash approach side and run-past |
+| `TRACE` / `DUMP` | arm full-rate move recording / dump it |
 | `Z` / `X` / `T` | zero position / stop / toggle telemetry |
-| `r` `m` `1`–`4` | diagnostics: full scan, PWM mapping, single-pin map |
+| `r` `m` `1`–`4` | full scan, PWM mapping, single-pin map |
+
+`TRACK` and `CPM` persist in NVS alongside the motor calibration.
 
 `X` also aborts a running calibration, which is why calibration polls the
 serial port itself rather than blocking the loop outright.
