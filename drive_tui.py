@@ -33,7 +33,7 @@ from rich.align import Align
 CPR = 4096.0
 
 HELP = [
-    ("↑ ↓", "drive fwd/back"), ("← →", "turn left/right"),
+    ("↑↓ or f/b", "drive fwd/back"), ("←→ or ,/.", "turn left/right"),
     ("+ -", "step ±5 cm"), ("[ ]", "turn step ±5°"),
     ("space", "STOP"), ("tab", "select wheel"),
     ("j / k", "wheel ∓90°"), ("z", "zero"), ("c", "calibrate"),
@@ -405,26 +405,44 @@ class App:
                 self.cmd += ch
             return
 
-        # Arrow keys arrive as ESC [ A/B/C/D, so pull the rest of the sequence.
+        # Arrow keys arrive as ESC [ A/B/C/D in normal cursor mode, but as
+        # ESC O A/B/C/D when the terminal is in application cursor mode --
+        # which the alternate screen used here often switches on. Accept both,
+        # and log anything unrecognised so an odd terminal is visible, not
+        # silently ignored.
         if ch == "\x1b":
             seq = ""
-            for _ in range(2):
-                r, _, _ = select.select([sys.stdin], [], [], 0.02)
+            for _ in range(4):
+                r, _, _ = select.select([sys.stdin], [], [], 0.05)
                 if not r:
                     break
                 seq += sys.stdin.read(1)
-            if seq == "[A":
+                if seq[-1].isalpha() or seq[-1] == "~":
+                    break
+            code = seq[-1:] if seq[:1] in ("[", "O") else ""
+            if code == "A":
                 self.forward(+1)
-            elif seq == "[B":
+            elif code == "B":
                 self.forward(-1)
-            elif seq == "[D":
+            elif code == "D":
                 self.steer(+1)      # left is counter-clockwise, positive
-            elif seq == "[C":
+            elif code == "C":
                 self.steer(-1)
+            elif seq:
+                self.link.log.append(("err", f"unknown key esc{seq!r}"))
+                self.link.write_log("KEY", f"esc{seq!r}")
             return
 
         if ch == "q":
             self.quit = True
+        elif ch == "f":
+            self.forward(+1)
+        elif ch == "b":
+            self.forward(-1)
+        elif ch == ",":
+            self.steer(+1)
+        elif ch == ".":
+            self.steer(-1)
         elif ch == "+" or ch == "=":
             self.step_m = min(2.0, self.step_m + 0.05)
         elif ch == "-":
