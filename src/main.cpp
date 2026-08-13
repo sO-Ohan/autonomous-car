@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
 
 // ---- harness pin map ----
 #define PIN_SDA        21
@@ -139,6 +140,19 @@ struct Wheel {
   bool     settled = true;
   uint32_t settleStart = 0;
 
+  // trapezoidal profile state -- the controller chases this, not the raw target
+  double   spPos = 0;         // setpoint position, counts
+  float    spVel = 0;         // setpoint velocity, counts/s
+  bool     profActive = false;
+  uint32_t holdStart = 0;
+  int      retries = 0;       // corrective re-moves used on the current command
+  uint8_t  creepState = 0;    // 0 start pulse, 1 pulsing, 2 pausing
+  uint32_t creepUntil = 0;
+  int      creepCount = 0;
+  int64_t  finalTarget = 0;   // where the move really ends
+  uint8_t  approachStage = 0; // 0 direct, 1 running past, 2 final approach
+  uint32_t stallStart = 0;
+
   int      minDutyFwd = 0, minDutyRev = 0;   // measured stiction thresholds
   float    slope = 0;                        // counts/s per duty unit
 
@@ -156,7 +170,61 @@ static Wheel WR("R", 2, 3, MASK_RIGHT);
 // degrees. One count is 0.088 deg, so tol 2 sits just above the sensor floor.
 static float Kp = 0.35f, Ki = 0.40f, Kd = 0.004f;
 static int   POS_TOL = 2;          // counts, ~0.18 deg
+
+// Motion profile limits. Arriving at the target with near-zero velocity is
+// what removes overshoot -- a step target makes the wheel run at full duty
+// until it is already there, and its own inertia carries it past.
+// Measured best of a VMAX/AMAX/Kv sweep: 0.18 deg overshoot, against 11.43 deg
+// with a step target and no profile.
+static float VMAX = 3000.0f;       // counts/s  (~44 rpm, top speed is ~16000)
+static float AMAX = 9000.0f;       // counts/s^2 (reaches VMAX in 0.33 s)
+static uint32_t HOLD_MS = 500;     // hold window before settling or retrying
+
+// Velocity feedback. Both PWM low is coast, not brake, so without this the
+// wheel's inertia carries it past a decelerating setpoint. This term commands
+// reverse duty whenever the wheel is running faster than the profile wants.
+// Scale reference: 1/slope ~ 0.014 duty per count/s.
+// Kv above ~0.06 goes unstable: it differentiates a quantised, filtered
+// velocity, and the sweep showed 258 deg of overshoot at Kv 0.14.
+static float Kv = 0.060f;
+static int   MAX_RETRY = 3;        // corrective re-moves for a large residual
+
+// Pulsed creep for the last few counts. Continuous drive cannot win here: the
+// duty needed to break stiction also carries the wheel past the target. Short
+// pulses with pauses let it stop between each one, so the step size is set by
+// pulse width rather than by friction.
+// Budget matters: measured backlash is ~35 counts and each pulse moves ~2-3,
+// so a 14-pulse budget was entirely consumed crossing the dead zone with
+// nothing left to position with. 60 pulses crosses it and still converges.
+static int   CREEP_MS = 12;        // pulse width -- ~2-3 counts per pulse
+static int   CREEP_GAP = 45;       // pause, long enough to come to rest
+static int   CREEP_BOOST = 6;      // duty above the measured deadband
+static int   CREEP_MAX = 60;       // pulses before accepting the residual
+
+// Backlash handling. There is lost motion between the motor and the encoder --
+// the motor can turn without the geared output following, so that region is
+// invisible to the control loop and cannot be tuned away. Instead every move
+// finishes travelling in the same direction, which loads the same tooth face
+// each time and makes final position repeatable. A move that would arrive from
+// the wrong side runs past by TAKEUP counts and comes back.
+static int   APPROACH_DIR = 1;     // 0 disables, +1 or -1 selects the side
+static int   TAKEUP = 90;          // counts to run past -- must exceed the ~35
+                                   // counts of measured backlash with margin
+
+// Runaway guard: an unstable gain must never be able to spin a wheel up.
+static float VEL_LIMIT = 18000.0f; // counts/s, above the measured 16089 top speed
 static bool  telem = false;
+
+// ---- move trace ----
+// Telemetry at 50 ms cannot see a transient: at top speed the wheel covers
+// ~70 deg between samples. This records every control tick into RAM during a
+// move so peak overshoot can be measured instead of eyeballed.
+#define TRACE_N 1500                  // 7.5 s at 200 Hz
+static int32_t  traceBuf[TRACE_N];
+static uint16_t traceCount = 0;
+static bool     traceArmed = false;
+static Wheel   *traceW = nullptr;
+static int64_t  traceStart = 0, traceTargetRel = 0;
 
 static void applyDuty(Wheel &w, int d) {
   d = constrain(d, -255, 255);
@@ -191,37 +259,176 @@ static void updateWheel(Wheel &w, float dt) {
   w.vel += 0.25f * (vraw - w.vel);    // light filter; raw is quantised and noisy
 }
 
+// Start a profiled move to an absolute target from wherever we are now.
+static void startMove(Wheel &w, int64_t absTarget) {
+  w.target = absTarget;
+  w.integ = 0;
+  w.prevErr = 0;
+  w.settled = false;
+  w.spPos = (double)w.pos;
+  w.spVel = 0;
+  w.profActive = true;
+  w.holdStart = 0;
+  w.retries = 0;
+  w.creepState = 0;
+  w.creepCount = 0;
+  w.stallStart = 0;
+  w.mode = 2;
+}
+
+// End of a move stage. If we only ran past the target to take up backlash,
+// this starts the real approach instead of reporting completion.
+static void finishMove(Wheel &w, const char *why) {
+  applyDuty(w, 0);
+  if (w.approachStage == 1) {
+    w.approachStage = 2;
+    startMove(w, w.finalTarget);
+    Serial.printf("APPROACH,%s,%lld\n", w.name, (long long)w.finalTarget);
+    return;
+  }
+  w.approachStage = 0;
+  w.settled = true;
+  w.mode = 0;
+  Serial.printf("DONE,%s,%lld,%.2f,%s\n", w.name,
+                (long long)(w.finalTarget - w.pos),
+                (w.finalTarget - w.pos) * 360.0f / CPR, why);
+}
+
 // PID with a stiction kick: below the measured deadband the motor makes no
 // torque at all, so a small proportional term would sit there humming.
 static void controlWheel(Wheel &w, float dt) {
+  // Runaway guard, checked before anything else can command duty.
+  if (w.mode != 0 && fabsf(w.vel) > VEL_LIMIT) {
+    stopWheel(w);
+    w.approachStage = 0;
+    Serial.printf("FAULT,%s,overspeed,%.0f\n", w.name, w.vel);
+    return;
+  }
   if (w.mode == 2) {
-    float err = (float)(w.target - w.pos);
-    if (fabsf(err) <= POS_TOL && fabsf(w.vel) < 60) {
-      if (!w.settled) {
-        if (w.settleStart == 0) w.settleStart = millis();
-        else if (millis() - w.settleStart > 150) {
-          w.settled = true;
-          applyDuty(w, 0);
-          Serial.printf("DONE,%s,%lld,%.2f\n", w.name,
-                        (long long)(w.target - w.pos),
-                        (w.target - w.pos) * 360.0f / CPR);
-          w.mode = 0;
-          return;
-        }
+    // ---- advance the trapezoidal profile one tick ----
+    if (w.profActive) {
+      double remain = (double)w.target - w.spPos;
+      float dir = (remain >= 0) ? 1.0f : -1.0f;
+      // distance needed to bleed off current setpoint speed at AMAX
+      float stopDist = (w.spVel * w.spVel) / (2.0f * AMAX);
+
+      if (fabs(remain) <= stopDist || fabs(remain) < 1.0) {
+        w.spVel -= dir * AMAX * dt;                     // decelerate
+        if (dir > 0 && w.spVel < 0) w.spVel = 0;
+        if (dir < 0 && w.spVel > 0) w.spVel = 0;
+      } else {
+        w.spVel += dir * AMAX * dt;                     // accelerate / cruise
+        w.spVel = constrain(w.spVel, -VMAX, VMAX);
       }
-      applyDuty(w, 0);
-      return;
+      w.spPos += w.spVel * dt;
+
+      // profile has arrived: hand over to the hold phase
+      if (fabs((double)w.target - w.spPos) < 1.0 && fabsf(w.spVel) < 30.0f) {
+        w.spPos = (double)w.target;
+        w.spVel = 0;
+        w.profActive = false;
+        w.holdStart = millis();
+      }
     }
-    w.settleStart = 0;
+
+    float err = (float)(w.spPos - (double)w.pos);       // track the setpoint
+    float finalErr = (float)(w.target - w.pos);
+
+    // ---- finish conditions ----
+    // Settle as soon as we are inside tolerance and actually stopped; and give
+    // up after HOLD_MS regardless, so a 1-count miss can never become a dither.
+    if (!w.profActive) {
+      bool stopped = fabsf(w.vel) < 40;
+      bool timeUp = (millis() - w.holdStart) > HOLD_MS;
+
+      if (fabsf(finalErr) <= POS_TOL && stopped) {
+        finishMove(w, "tol");
+        return;
+      }
+      // A large residual means the wheel coasted well past. Re-run a short
+      // profile at the remaining distance -- a controlled micro-move.
+      if (fabsf(finalErr) > 20 && w.retries < MAX_RETRY && timeUp) {
+        w.retries++;
+        w.spPos = (double)w.pos;
+        w.spVel = 0;
+        w.profActive = true;
+        w.holdStart = 0;
+        w.integ = 0;
+        w.creepState = 0;
+        Serial.printf("RETRY,%s,%d,%.2f\n", w.name, w.retries, finalErr * 360.0f / CPR);
+      } else {
+        // Pulsed creep for the last few counts.
+        if (w.creepCount >= CREEP_MAX) { finishMove(w, "creepmax"); return; }
+        uint32_t tnow = millis();
+        if (w.creepState == 0) {
+          int dir = (finalErr > 0) ? 1 : -1;
+          int md = (dir > 0) ? w.minDutyFwd : w.minDutyRev;
+          if (md <= 0) md = 30;
+          applyDuty(w, dir * (md + CREEP_BOOST));
+          w.creepUntil = tnow + CREEP_MS;
+          w.creepState = 1;
+        } else if (w.creepState == 1) {
+          if (tnow >= w.creepUntil) {
+            applyDuty(w, 0);
+            w.creepUntil = tnow + CREEP_GAP;
+            w.creepState = 2;
+            w.creepCount++;
+          }
+        } else {
+          applyDuty(w, 0);
+          if (tnow >= w.creepUntil) w.creepState = 0;
+        }
+        return;
+      }
+    }
+
+    // Stall guard. Inside the backlash band the motor turns but the encoder
+    // does not, so the integrator would wind up and buzz the motor against
+    // nothing. If we are commanding real duty and seeing no motion, bleed the
+    // integral away instead of pushing harder.
+    // Only a mild bleed, and only after a long stall: crossing the backlash
+    // band looks exactly like a stall, and decaying hard here was stopping the
+    // controller from pushing through it at all.
+    int mdNow = (w.duty >= 0) ? w.minDutyFwd : w.minDutyRev;
+    if (abs(w.duty) > mdNow && fabsf(w.vel) < 50.0f) {
+      if (w.stallStart == 0) w.stallStart = millis();
+      else if (millis() - w.stallStart > 700) w.integ *= 0.995f;
+    } else {
+      w.stallStart = 0;
+    }
 
     w.integ += err * dt;
-    w.integ = constrain(w.integ, -4000.0f, 4000.0f);      // anti-windup
+    w.integ = constrain(w.integ, -2000.0f, 2000.0f);     // anti-windup
     float deriv = (dt > 0) ? (err - w.prevErr) / dt : 0;
     w.prevErr = err;
 
-    float u = Kp * err + Ki * w.integ + Kd * deriv;
-    int md = (u >= 0) ? w.minDutyFwd : w.minDutyRev;
-    if (md > 0 && fabsf(u) < md) u = (u >= 0 ? md : -md);  // kick past stiction
+    // Feedforward from the calibration: viscous term from the duty/speed slope
+    // plus the measured stiction offset. With this carrying the motion, the PID
+    // only trims small errors, so it never needs a large corrective kick.
+    float ff = 0;
+    if (fabsf(w.spVel) > 1.0f) {
+      ff = (w.slope > 1.0f) ? (w.spVel / w.slope) : 0;      // viscous / back-EMF
+      // Stiction help only while we are genuinely behind the setpoint. Adding
+      // it whenever spVel is non-zero biases the output forwards and fights
+      // the braking during the deceleration ramp.
+      if (err * w.spVel > 0) {
+        float md = (w.spVel >= 0) ? w.minDutyFwd : w.minDutyRev;
+        ff += (w.spVel >= 0 ? md : -md) * 0.70f;
+      }
+    }
+
+    float u = ff + Kp * err + Ki * w.integ + Kd * deriv
+              + Kv * (w.spVel - w.vel);                     // active braking
+
+    // Stiction kick, gated on distance REMAINING rather than tracking error:
+    // during a small corrective move the setpoint creeps and tracking error
+    // stays tiny, so a tracking-error gate never fires and the move stalls.
+    // The direction test means the kick can only ever push toward the target,
+    // which is what stops it turning into the old dither.
+    if (fabsf(finalErr) > POS_TOL) {
+      float md = (u >= 0) ? w.minDutyFwd : w.minDutyRev;
+      if (md > 0 && fabsf(u) < md && u * finalErr > 0) u = (u >= 0 ? md : -md);
+    }
     applyDuty(w, (int)constrain(u, -255.0f, 255.0f));
 
   } else if (w.mode == 3) {
@@ -277,6 +484,34 @@ static int findDeadband(Wheel &w, int sign) {
   return 0;
 }
 
+// Calibration must survive a reboot. Without it minDutyFwd/Rev are zero, the
+// stiction kick is disabled, and moves silently undershoot -- which looked
+// like a controller fault until the reason codes showed otherwise.
+static Preferences prefs;
+
+static void calSave(Wheel &w) {
+  prefs.begin("drive", false);
+  char k[8];
+  snprintf(k, sizeof k, "%sdf", w.name); prefs.putInt(k, w.minDutyFwd);
+  snprintf(k, sizeof k, "%sdr", w.name); prefs.putInt(k, w.minDutyRev);
+  snprintf(k, sizeof k, "%ssl", w.name); prefs.putFloat(k, w.slope);
+  prefs.end();
+}
+
+static bool calLoad(Wheel &w) {
+  prefs.begin("drive", true);
+  char k[8];
+  snprintf(k, sizeof k, "%sdf", w.name); int df = prefs.getInt(k, 0);
+  snprintf(k, sizeof k, "%sdr", w.name); int dr = prefs.getInt(k, 0);
+  snprintf(k, sizeof k, "%ssl", w.name); float sl = prefs.getFloat(k, 0.0f);
+  prefs.end();
+  if (df > 0 && dr > 0) {
+    w.minDutyFwd = df; w.minDutyRev = dr; w.slope = sl;
+    return true;
+  }
+  return false;
+}
+
 static void calibrate(Wheel &w) {
   Serial.printf("CALSTART,%s\n", w.name);
   calAbort = false;
@@ -309,6 +544,7 @@ static void calibrate(Wheel &w) {
   float denom = n * sxx - sx * sx;
   w.slope = (n > 1 && fabsf(denom) > 1e-6f) ? (n * sxy - sx * sy) / denom : 0;
   Serial.printf("CALSLOPE,%s,%.3f\n", w.name, w.slope);
+  calSave(w);
   Serial.printf("CALDONE,%s\n", w.name);
 }
 
@@ -498,12 +734,27 @@ static Wheel *pickWheel(const String &s) {
 }
 
 static void moveBy(Wheel &w, float degrees) {
-  w.target = w.pos + (int64_t)lroundf(degrees * CPR / 360.0f);
-  w.integ = 0;
-  w.prevErr = 0;
-  w.settled = false;
-  w.settleStart = 0;
-  w.mode = 2;
+  int64_t tgt = w.pos + (int64_t)lroundf(degrees * CPR / 360.0f);
+  w.finalTarget = tgt;
+  int64_t delta = tgt - w.pos;
+
+  if (traceArmed) {                 // record this move at the full loop rate
+    traceW = &w;
+    traceStart = w.pos;
+    traceTargetRel = delta;
+    traceCount = 0;
+  }
+
+  // Arrive from the same side every time. If this move would approach from the
+  // wrong direction, run past the target first and turn around.
+  bool wrongWay = (APPROACH_DIR > 0 && delta < 0) || (APPROACH_DIR < 0 && delta > 0);
+  if (APPROACH_DIR != 0 && wrongWay) {
+    w.approachStage = 1;
+    startMove(w, tgt - (int64_t)APPROACH_DIR * TAKEUP);
+  } else {
+    w.approachStage = 0;
+    startMove(w, tgt);
+  }
   Serial.printf("ACK,move,%s,%.2f\n", w.name, degrees);
 }
 
@@ -548,12 +799,37 @@ static void handleLine(String line) {
   } else if (cmd == "C" && n >= 2) {          // C <L|R>  calibrate
     Wheel *w = pickWheel(tok[1]);
     if (w) calibrate(*w);
-  } else if (cmd == "K" && n >= 4) {          // K <kp> <ki> <kd>
+  } else if (cmd == "K" && n >= 4) {          // K <kp> <ki> <kd> [kv]
     Kp = tok[1].toFloat(); Ki = tok[2].toFloat(); Kd = tok[3].toFloat();
-    Serial.printf("ACK,gains,%.3f,%.3f,%.4f\n", Kp, Ki, Kd);
+    // Kv is clamped: the sweep measured 258 deg of overshoot at Kv 0.14, so
+    // values above the stable ceiling are not accepted from the console.
+    if (n >= 5) Kv = constrain(tok[4].toFloat(), 0.0f, 0.070f);
+    Serial.printf("ACK,gains,%.3f,%.3f,%.4f,%.4f\n", Kp, Ki, Kd, Kv);
+  } else if (cmd == "APPROACH" && n >= 3) {   // APPROACH <0|1|-1> <takeup>
+    APPROACH_DIR = tok[1].toInt();
+    TAKEUP = tok[2].toInt();
+    Serial.printf("ACK,approach,%d,%d\n", APPROACH_DIR, TAKEUP);
   } else if (cmd == "TOL" && n >= 2) {
     POS_TOL = tok[1].toInt();
     Serial.printf("ACK,tol,%d\n", POS_TOL);
+  } else if (cmd == "PROF" && n >= 3) {       // PROF <vmax> <amax>
+    VMAX = tok[1].toFloat();
+    AMAX = tok[2].toFloat();
+    Serial.printf("ACK,prof,%.0f,%.0f\n", VMAX, AMAX);
+  } else if (cmd == "TRACE") {
+    traceArmed = !traceArmed;
+    traceCount = 0;
+    traceW = nullptr;
+    Serial.printf("ACK,trace,%d\n", traceArmed ? 1 : 0);
+  } else if (cmd == "DUMP") {
+    Serial.printf("TRC,%u,%lld\n", traceCount, (long long)traceTargetRel);
+    for (uint16_t i = 0; i < traceCount; i += 20) {
+      Serial.printf("TD,%u", i);
+      for (uint16_t j = i; j < i + 20 && j < traceCount; j++)
+        Serial.printf(",%ld", (long)traceBuf[j]);
+      Serial.println();
+    }
+    Serial.println(F("TRCEND"));
   } else if (cmd == "Z") {                    // zero both positions
     WL.pos = WL.target = 0; WR.pos = WR.target = 0;
     Serial.println(F("ACK,zero"));
@@ -581,6 +857,13 @@ void setup() {
 
   Serial.println(F("\n\n########## DRIVE HARNESS ##########"));
   Serial.println(F("Motor rail live, EN strapped to VCC -- drivers always enabled."));
+
+  bool cl = calLoad(WL), cr = calLoad(WR);
+  Serial.printf("CALLOAD,L,%d,%d,%d,%.2f\n", cl ? 1 : 0, WL.minDutyFwd, WL.minDutyRev, WL.slope);
+  Serial.printf("CALLOAD,R,%d,%d,%d,%.2f\n", cr ? 1 : 0, WR.minDutyFwd, WR.minDutyRev, WR.slope);
+  if (!cl || !cr)
+    Serial.println(F("WARNING: not calibrated -- run C L and C R, or moves will undershoot."));
+
   runAll();
 }
 
@@ -604,6 +887,9 @@ void loop() {
     updateWheel(WR, dt);
     controlWheel(WL, dt);
     controlWheel(WR, dt);
+
+    if (traceW && traceCount < TRACE_N)
+      traceBuf[traceCount++] = (int32_t)(traceW->pos - traceStart);
   }
 
   uint32_t ms = millis();

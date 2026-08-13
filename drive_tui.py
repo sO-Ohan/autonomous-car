@@ -15,6 +15,7 @@ import sys
 import time
 import threading
 import queue
+import os
 import termios
 import tty
 import select
@@ -43,13 +44,21 @@ HELP = [
 class Link(threading.Thread):
     """Serial reader/writer. Parses the firmware's line protocol."""
 
-    def __init__(self, port):
+    def __init__(self, port, logdir="logs"):
         super().__init__(daemon=True)
         self.port = port
         self.out = queue.Queue()
         self.running = True
         self.ser = None
         self.connected = False
+
+        # Every byte in and out goes to disk. Debugging a motion problem after
+        # the fact is impossible from an in-memory ring buffer.
+        os.makedirs(logdir, exist_ok=True)
+        self.logpath = os.path.join(
+            logdir, time.strftime("session-%Y%m%d-%H%M%S.log"))
+        self.logf = open(self.logpath, "a", buffering=1)
+        self.logf.write(f"# drive_tui session {time.asctime()} port={port}\n")
 
         self.d = {}                      # latest D, telemetry frame
         self.s = {}                      # latest S, status frame
@@ -61,9 +70,16 @@ class Link(threading.Thread):
         self._n = 0
         self._t0 = time.time()
 
+    def write_log(self, kind, msg):
+        try:
+            self.logf.write(f"{time.time():.3f} {kind} {msg}\n")
+        except Exception:
+            pass
+
     def send(self, line):
         self.out.put(line)
         self.log.append(("tx", line))
+        self.write_log("TX", line)
 
     def run(self):
         try:
@@ -108,6 +124,7 @@ class Link(threading.Thread):
     def parse(self, line):
         if not line:
             return
+        self.write_log("RX", line)
         p = line.split(",")
         tag = p[0]
 

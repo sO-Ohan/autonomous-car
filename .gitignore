@@ -10,6 +10,9 @@ __pycache__/
 venv/
 .venv/
 
+# session logs and captured traces
+logs/
+
 # OS
 *.swp
 .DS_Store

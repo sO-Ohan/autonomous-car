@@ -84,10 +84,48 @@ serial port itself rather than blocking the loop outright.
 ### Control design
 
 Position is tracked by unwrapping the AS5600's 12-bit angle into an `int64_t`,
-so travel is unbounded across revolutions. The PID adds a **stiction kick**:
-below the measured deadband a BTS7960-driven motor produces no torque at all,
-so a small proportional term would just sit there humming. Any output below
-the calibrated deadband is raised to it.
+so travel is unbounded across revolutions. Four things beyond a plain PID earn
+their place, each because a measurement forced it:
+
+**Trapezoidal motion profile.** A step target makes the wheel run at full duty
+until it is already at the target, and its own inertia carries it past — that
+was 11.43° of overshoot on a 360° move. The controller instead chases a
+setpoint that accelerates, cruises and decelerates into the target, arriving at
+near-zero speed.
+
+**Velocity feedback (`Kv`).** Both PWM inputs low is *coast*, not brake, so
+without an active term nothing opposes the wheel's momentum. `Kv` commands
+reverse duty whenever the wheel runs faster than the profile wants. It is
+clamped at 0.070: a sweep measured 258° of overshoot at `Kv 0.14`, because the
+term differentiates a quantised, filtered velocity and goes unstable.
+
+**Stiction kick, gated on distance remaining.** Below the measured deadband the
+motor makes no torque, so a small proportional term just hums. The gate is on
+distance to target, not tracking error — during a small corrective move the
+setpoint creeps and tracking error stays tiny, so a tracking-error gate never
+fires and the move stalls. A direction test means the kick can only ever push
+toward the target.
+
+**Backlash handling.** There is roughly 35 counts (~3°) of lost motion between
+the motor and the encoder: the motor turns without the geared output following,
+so that region is invisible to the loop and cannot be tuned away. Two measures
+address it. Every move finishes travelling in the same direction (`APPROACH`),
+running past the target by `TAKEUP` counts and coming back if it would
+otherwise arrive from the wrong side, so the same tooth face is loaded every
+time. And the final counts are closed with **pulsed creep** — short pulses with
+pauses — because the continuous duty needed to break stiction also carries the
+wheel past.
+
+A runaway guard cuts drive and reports `FAULT` above `VEL_LIMIT`, so an
+unstable gain cannot spin a wheel up.
+
+### Calibration persists
+
+Calibration is stored in NVS and reloaded at boot. This matters more than it
+sounds: with no calibration the deadband is zero, the stiction kick is disabled
+entirely, and every move silently undershoots — which looks exactly like a
+controller fault. The boot banner prints `CALLOAD` for each wheel and warns if
+either is missing.
 
 ### What the check sequence proves
 
@@ -190,6 +228,47 @@ Settling error over 6 moves per setting:
 Raising Kp did not help — at Kp 0.55 the wheel hunted and failed to settle on
 3 of 6 moves. Tolerance, not gain, was the limiting factor. One count is
 0.088°, so tol 2 sits just above the encoder's quantisation floor.
+
+### Overshoot and repeatability
+
+Overshoot on a 360° move, as the controller was built up:
+
+| | overshoot |
+|---|---|
+| step target, no profile | 11.43° |
+| profile only | 6.42° |
+| profile + velocity feedback + corrected kick gate | **0.18–0.79°** |
+
+Repeatability over 6 cycles of +90°/−90°, which is the number that exposes
+backlash — an individual move can report a small error while the pair still
+loses ground:
+
+| | before | after |
+|---|---|---|
+| LEFT drift | −23.64° | **−1.14°** |
+| LEFT spread | 20.30° | **0.70°** |
+| RIGHT drift | −22.24° | **−2.02°** |
+| RIGHT spread | 18.90° | **1.32°** |
+
+The important change is that drift is now bounded rather than accumulating.
+
+Individual moves settle at 0.00°–0.18° with reason `tol` when calibrated:
+
+```
+L  +90:  DONE,L, 2, 0.18,tol
+L  -90:  APPROACH,L,25872   ->  DONE,L, 0, 0.00,tol
+R  -90:  APPROACH,R,27064   ->  DONE,R,-2,-0.18,tol
+```
+
+Note that a move opposite to the approach direction shows ~8° of apparent
+overshoot in `analyze_moves.py`. That is the planned `TAKEUP` run-past, not a
+control fault.
+
+## Logs
+
+`drive_tui.py` writes every line sent and received to
+`logs/session-YYYYmmdd-HHMMSS.log` with timestamps. `analyze_moves.py --csv
+DIR` writes each move's full 200 Hz position trace as CSV. Both are gitignored.
 
 ## Status
 
