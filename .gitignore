@@ -1,0 +1,15 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# OS
+*.swp
+.DS_Store
