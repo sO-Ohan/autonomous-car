@@ -33,11 +33,11 @@ from rich.align import Align
 CPR = 4096.0
 
 HELP = [
-    ("↑↓ or f/b", "drive fwd/back"), ("←→ or ,/.", "turn left/right"),
-    ("+ -", "step ±5 cm"), ("[ ]", "turn step ±5°"),
-    ("space", "STOP"), ("tab", "select wheel"),
-    ("j / k", "wheel ∓90°"), ("z", "zero"), ("c", "calibrate"),
-    (":", "command"), ("q", "quit"),
+    ("w / s", "forward / back"), ("a / d", "left / right"),
+    ("↑↓←→", "same"), ("+ -", "step ±5 cm"), ("[ ]", "turn step ±5°"),
+    ("i / o", "flip drive / steer"), ("space", "STOP"),
+    ("tab", "wheel"), ("j / k", "wheel ∓90°"), ("z", "zero"),
+    ("c", "calibrate"), (":", "command"), ("q", "quit"),
 ]
 
 
@@ -226,6 +226,8 @@ class App:
         self.port = port
         self.step_m = 0.20          # metres per arrow press
         self.step_deg = 15.0        # degrees per arrow press
+        self.inv_drive = 1          # flip with 'i' if w/s are backwards
+        self.inv_steer = 1          # flip with 'o' if a/d are backwards
 
     # ------------------------------------------------------------- rendering
     def wheel_panel(self, w):
@@ -335,8 +337,14 @@ class App:
         track = self.link.geom.get("track", 0)
         turn_mode = f"TURN {self.step_deg:.0f}°" if track > 0 else \
                     f"SPIN {self.step_deg:.0f}° wheel (TRACK unset)"
+        flags = []
+        if self.inv_drive < 0:
+            flags.append("drive INV")
+        if self.inv_steer < 0:
+            flags.append("steer INV")
         drive = (f"step {self.step_m*100:.0f} cm   {turn_mode}"
-                 f"   cpm {self.link.geom.get('cpm', 0):.0f}")
+                 f"   cpm {self.link.geom.get('cpm', 0):.0f}"
+                 + ("   " + " ".join(flags) if flags else ""))
         gains = (f"Kp {s.get('kp', 0):.3f}   Ki {s.get('ki', 0):.3f}   "
                  f"Kd {s.get('kd', 0):.4f}   tol {s.get('tol', 0)} cts") if s else "gains —"
         gains = drive + "      " + gains
@@ -368,10 +376,14 @@ class App:
 
     # ------------------------------------------------------------- input
     # ---- driving -------------------------------------------------------
+    # inv_drive / inv_steer let the operator correct the convention live, since
+    # which way is "forward" depends on how the motors and wheels are mounted
+    # and cannot be known from the firmware side.
     def forward(self, sign):
-        self.link.send(f"DRIVE {sign * self.step_m:.3f}")
+        self.link.send(f"DRIVE {sign * self.inv_drive * self.step_m:.3f}")
 
     def steer(self, sign):
+        sign *= self.inv_steer
         """
         Left/right. With TRACK measured this is a real heading change; without
         it, fall back to SPIN, which counter-rotates the wheels by a known
@@ -435,14 +447,18 @@ class App:
 
         if ch == "q":
             self.quit = True
-        elif ch == "f":
+        elif ch in ("w", "f"):
             self.forward(+1)
-        elif ch == "b":
+        elif ch in ("s", "b"):
             self.forward(-1)
-        elif ch == ",":
+        elif ch in ("a", ","):
             self.steer(+1)
-        elif ch == ".":
+        elif ch in ("d", "."):
             self.steer(-1)
+        elif ch == "i":
+            self.inv_drive *= -1
+        elif ch == "o":
+            self.inv_steer *= -1
         elif ch == "+" or ch == "=":
             self.step_m = min(2.0, self.step_m + 0.05)
         elif ch == "-":
@@ -474,10 +490,8 @@ class App:
             self.rotate(-360)
         elif ch == "K":
             self.rotate(360)
-        elif ch == "w":
-            self.nudge_duty(10)
-        elif ch == "s":
-            self.nudge_duty(-10)
+        # (open-loop duty moved off w/s to free them for driving --
+        #  use the ':' prompt, e.g.  d 120  )
         elif ch == ":":
             self.cmd_mode = True
             self.cmd = ""
