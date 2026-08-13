@@ -8,6 +8,31 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+
+// ---- output tee ----
+// Everything the firmware prints goes to USB serial AND to the TCP client, so
+// the wireless link is a peer of the cable rather than a replacement. A WiFi
+// failure can never leave the board unreachable.
+#define TCP_PORT 3333
+static WiFiServer tcpServer(TCP_PORT);
+static WiFiClient tcpClient;
+
+class Tee : public Print {
+ public:
+  size_t write(uint8_t c) override {
+    Serial.write(c);
+    if (tcpClient && tcpClient.connected()) tcpClient.write(c);
+    return 1;
+  }
+  size_t write(const uint8_t *b, size_t n) override {
+    Serial.write(b, n);
+    if (tcpClient && tcpClient.connected()) tcpClient.write(b, n);
+    return n;
+  }
+};
+static Tee Out;
 
 // ---- harness pin map ----
 #define PIN_SDA        21
@@ -297,13 +322,13 @@ static void finishMove(Wheel &w, const char *why) {
   if (w.approachStage == 1) {
     w.approachStage = 2;
     startMove(w, w.finalTarget);
-    Serial.printf("APPROACH,%s,%lld\n", w.name, (long long)w.finalTarget);
+    Out.printf("APPROACH,%s,%lld\n", w.name, (long long)w.finalTarget);
     return;
   }
   w.approachStage = 0;
   w.settled = true;
   w.mode = 0;
-  Serial.printf("DONE,%s,%lld,%.2f,%s\n", w.name,
+  Out.printf("DONE,%s,%lld,%.2f,%s\n", w.name,
                 (long long)(w.finalTarget - w.pos),
                 (w.finalTarget - w.pos) * 360.0f / CPR, why);
 }
@@ -315,7 +340,7 @@ static void controlWheel(Wheel &w, float dt) {
   if (w.mode != 0 && fabsf(w.vel) > VEL_LIMIT) {
     stopWheel(w);
     w.approachStage = 0;
-    Serial.printf("FAULT,%s,overspeed,%.0f\n", w.name, w.vel);
+    Out.printf("FAULT,%s,overspeed,%.0f\n", w.name, w.vel);
     return;
   }
   if (w.mode == 2) {
@@ -369,7 +394,7 @@ static void controlWheel(Wheel &w, float dt) {
         w.holdStart = 0;
         w.integ = 0;
         w.creepState = 0;
-        Serial.printf("RETRY,%s,%d,%.2f\n", w.name, w.retries, finalErr * 360.0f / CPR);
+        Out.printf("RETRY,%s,%d,%.2f\n", w.name, w.retries, finalErr * 360.0f / CPR);
       } else {
         // Pulsed creep for the last few counts.
         if (w.creepCount >= CREEP_MAX) { finishMove(w, "creepmax"); return; }
@@ -527,7 +552,7 @@ static bool calLoad(Wheel &w) {
 }
 
 static void calibrate(Wheel &w) {
-  Serial.printf("CALSTART,%s\n", w.name);
+  Out.printf("CALSTART,%s\n", w.name);
   calAbort = false;
   stopWheel(w);
   calSettle(w, 200);
@@ -536,7 +561,7 @@ static void calibrate(Wheel &w) {
   int rev = findDeadband(w, -1);
   w.minDutyFwd = fwd;
   w.minDutyRev = rev;
-  Serial.printf("CALDEAD,%s,%d,%d\n", w.name, fwd, rev);
+  Out.printf("CALDEAD,%s,%d,%d\n", w.name, fwd, rev);
 
   // duty -> speed curve, from just above the deadband to full scale
   int lo = max(fwd, 20);
@@ -547,54 +572,54 @@ static void calibrate(Wheel &w) {
     applyDuty(w, d);
     calSettle(w, 320);                    // let it reach steady state
     float v = calMeasureVel(w, 220);
-    Serial.printf("CALPT,%s,%d,%.1f\n", w.name, d, v);
+    Out.printf("CALPT,%s,%d,%.1f\n", w.name, d, v);
     sx += d; sy += v; sxx += (float)d * d; sxy += d * v; n++;
   }
   applyDuty(w, 0);
   stopWheel(w);
 
-  if (calAbort) { Serial.printf("CALABORT,%s\n", w.name); calAbort = false; return; }
+  if (calAbort) { Out.printf("CALABORT,%s\n", w.name); calAbort = false; return; }
 
   float denom = n * sxx - sx * sx;
   w.slope = (n > 1 && fabsf(denom) > 1e-6f) ? (n * sxy - sx * sy) / denom : 0;
-  Serial.printf("CALSLOPE,%s,%.3f\n", w.name, w.slope);
+  Out.printf("CALSLOPE,%s,%.3f\n", w.name, w.slope);
   calSave(w);
-  Serial.printf("CALDONE,%s\n", w.name);
+  Out.printf("CALDONE,%s\n", w.name);
 }
 
 // ---------------------------------------------------------------- diagnostics
 static bool leftOk = false, rightOk = false;
 
 static void testUpstream() {
-  Serial.println(F("\n[1] UPSTREAM BUS  (mux cleared -- only 0x70 should answer)"));
+  Out.println(F("\n[1] UPSTREAM BUS  (mux cleared -- only 0x70 should answer)"));
   muxWrite(0x00);
   int found = 0;
   for (uint8_t a = 0x08; a < 0x78; a++) {
     if (ping(a)) {
-      Serial.printf("      0x%02X responds", a);
-      if (a == MUX_ADDR)      Serial.print(F("   <- PCA9548A, correct"));
-      else if (a == ENC_ADDR) Serial.print(F("   <- WRONG: an AS5600 is on the upstream bus"));
-      Serial.println();
+      Out.printf("      0x%02X responds", a);
+      if (a == MUX_ADDR)      Out.print(F("   <- PCA9548A, correct"));
+      else if (a == ENC_ADDR) Out.print(F("   <- WRONG: an AS5600 is on the upstream bus"));
+      Out.println();
       found++;
     }
   }
-  if (!found) Serial.println(F("      nothing answered -- SDA/SCL swapped, unpowered, or no pull-ups."));
+  if (!found) Out.println(F("      nothing answered -- SDA/SCL swapped, unpowered, or no pull-ups."));
 }
 
 static void testMuxRegister() {
-  Serial.println(F("\n[2] MUX CONTROL REGISTER  (write a mask, read it back)"));
+  Out.println(F("\n[2] MUX CONTROL REGISTER  (write a mask, read it back)"));
   const uint8_t masks[] = { 0x00, MASK_LEFT, MASK_RIGHT, 0x00 };
   for (uint8_t i = 0; i < 4; i++) {
     bool w = muxWrite(masks[i]);
     delay(2);
     int rb = muxRead();
-    Serial.printf("      wrote 0x%02X -> ack %s, read back 0x%02X  %s\n",
+    Out.printf("      wrote 0x%02X -> ack %s, read back 0x%02X  %s\n",
                   masks[i], w ? "yes" : "NO ", rb, (w && rb == masks[i]) ? "ok" : "MISMATCH");
   }
 }
 
 static void testResetPin() {
-  Serial.println(F("\n[3] MUX RESET LINE  (GPIO 5 -- pulse low, register must clear)"));
+  Out.println(F("\n[3] MUX RESET LINE  (GPIO 5 -- pulse low, register must clear)"));
   muxWrite(MASK_LEFT);
   delay(2);
   int before = muxRead();
@@ -603,56 +628,56 @@ static void testResetPin() {
   digitalWrite(PIN_MUX_RESET, HIGH);
   delay(2);
   int after = muxRead();
-  Serial.printf("      before 0x%02X, after 0x%02X  -> %s\n", before, after,
+  Out.printf("      before 0x%02X, after 0x%02X  -> %s\n", before, after,
                 (before == MASK_LEFT && after == 0x00)
                   ? "RESET wired and working"
                   : "RESET not effective (software i2cRecover() is the fallback)");
 }
 
 static void scanAllChannels() {
-  Serial.println(F("\n[4] PER-CHANNEL SCAN  (all 8, so a mis-plugged channel shows up)"));
+  Out.println(F("\n[4] PER-CHANNEL SCAN  (all 8, so a mis-plugged channel shows up)"));
   for (uint8_t ch = 0; ch < 8; ch++) {
     uint8_t mask = 1 << ch;
-    if (!muxWrite(mask)) { Serial.printf("      ch%d  mux write failed\n", ch); continue; }
+    if (!muxWrite(mask)) { Out.printf("      ch%d  mux write failed\n", ch); continue; }
     delay(2);
     bool enc = ping(ENC_ADDR);
     const char *tag = "";
     if (mask == MASK_LEFT)  tag = enc ? "  <- LEFT, as designed" : "  <- LEFT expected, MISSING";
     if (mask == MASK_RIGHT) tag = enc ? "  <- RIGHT, as designed" : "  <- RIGHT expected, MISSING";
     if (enc && mask != MASK_LEFT && mask != MASK_RIGHT) tag = "  <- unexpected device";
-    Serial.printf("      ch%d (mask 0x%02X)  %s%s\n", ch, mask,
+    Out.printf("      ch%d (mask 0x%02X)  %s%s\n", ch, mask,
                   enc ? "AS5600 @ 0x36 present" : "empty", tag);
     if (mask == MASK_LEFT)  leftOk = enc;
     if (mask == MASK_RIGHT) rightOk = enc;
   }
   muxWrite(0x00);
   delay(2);
-  Serial.printf("      isolation: mask 0x00 -> 0x36 %s\n",
+  Out.printf("      isolation: mask 0x00 -> 0x36 %s\n",
                 ping(ENC_ADDR) ? "STILL VISIBLE (not isolating)" : "gone, correct");
 }
 
 static void encoderHealth(const char *name, uint8_t mask) {
-  Serial.printf("\n      -- %s (mask 0x%02X) --\n", name, mask);
-  if (!muxWrite(mask)) { Serial.println(F("      mux select failed")); return; }
+  Out.printf("\n      -- %s (mask 0x%02X) --\n", name, mask);
+  if (!muxWrite(mask)) { Out.println(F("      mux select failed")); return; }
   delay(2);
   int st = as5600Read8(AS_STATUS);
-  if (st < 0) { Serial.println(F("      no response from 0x36")); return; }
+  if (st < 0) { Out.println(F("      no response from 0x36")); return; }
   bool md = st & 0x20, ml = st & 0x10, mh = st & 0x08;
-  Serial.printf("      STATUS 0x0B = 0x%02X   MD=%d ML=%d MH=%d\n", st, md, ml, mh);
-  if (!md)     Serial.println(F("      -> NO MAGNET DETECTED."));
-  else if (ml) Serial.println(F("      -> magnet too WEAK: move it closer."));
-  else if (mh) Serial.println(F("      -> magnet too STRONG: move it further away."));
-  else         Serial.println(F("      -> magnet detected and in range."));
-  Serial.printf("      AGC 0x1A = %d  (aim for ~64 mid-scale at 3.3 V)\n", as5600Read8(AS_AGC));
-  Serial.printf("      MAGNITUDE = %d\n", as5600Read12(AS_MAGNITUDE));
+  Out.printf("      STATUS 0x0B = 0x%02X   MD=%d ML=%d MH=%d\n", st, md, ml, mh);
+  if (!md)     Out.println(F("      -> NO MAGNET DETECTED."));
+  else if (ml) Out.println(F("      -> magnet too WEAK: move it closer."));
+  else if (mh) Out.println(F("      -> magnet too STRONG: move it further away."));
+  else         Out.println(F("      -> magnet detected and in range."));
+  Out.printf("      AGC 0x1A = %d  (aim for ~64 mid-scale at 3.3 V)\n", as5600Read8(AS_AGC));
+  Out.printf("      MAGNITUDE = %d\n", as5600Read12(AS_MAGNITUDE));
   int raw = as5600Read12(AS_RAW_ANGLE);
-  Serial.printf("      RAW_ANGLE 0x0C = %d  (%.1f deg)\n", raw, raw * 360.0 / CPR);
+  Out.printf("      RAW_ANGLE 0x0C = %d  (%.1f deg)\n", raw, raw * 360.0 / CPR);
 }
 
 static void testEncoders() {
-  Serial.println(F("\n[5] ENCODER HEALTH  (magnet placement read from registers)"));
-  if (leftOk)  encoderHealth("LEFT  ch6", MASK_LEFT);  else Serial.println(F("\n      -- LEFT ch6: absent --"));
-  if (rightOk) encoderHealth("RIGHT ch3", MASK_RIGHT); else Serial.println(F("\n      -- RIGHT ch3: absent --"));
+  Out.println(F("\n[5] ENCODER HEALTH  (magnet placement read from registers)"));
+  if (leftOk)  encoderHealth("LEFT  ch6", MASK_LEFT);  else Out.println(F("\n      -- LEFT ch6: absent --"));
+  if (rightOk) encoderHealth("RIGHT ch3", MASK_RIGHT); else Out.println(F("\n      -- RIGHT ch3: absent --"));
   muxWrite(0x00);
 }
 
@@ -693,24 +718,24 @@ static void mapPin(uint8_t idx) {
   const char *v = (lm && rm) ? "BOTH -- shared wire or vibration"
                 : lm ? "-> drives the LEFT wheel"
                 : rm ? "-> drives the RIGHT wheel" : "-> nothing moved";
-  Serial.printf("      %-12s  left %+6ld  right %+6ld   %s\n", PWM_NAME[idx], lacc, racc, v);
+  Out.printf("      %-12s  left %+6ld  right %+6ld   %s\n", PWM_NAME[idx], lacc, racc, v);
 }
 
 static void mappingTest() {
-  Serial.println(F("\n[M] PWM MAPPING  (one pin at a time, both encoders watched)"));
-  Serial.println(F("      60% duty, 1.2 s per pin. WHEELS OFF THE GROUND."));
+  Out.println(F("\n[M] PWM MAPPING  (one pin at a time, both encoders watched)"));
+  Out.println(F("      60% duty, 1.2 s per pin. WHEELS OFF THE GROUND."));
   for (uint8_t i = 0; i < 4; i++) mapPin(i);
   killDrive();
-  Serial.println(F("      PASS = each label moves its own wheel, RPWM +ve and LPWM -ve."));
+  Out.println(F("      PASS = each label moves its own wheel, RPWM +ve and LPWM -ve."));
 }
 
 static void summary() {
-  Serial.println(F("\n================ SUMMARY ================"));
-  Serial.printf("  PCA9548A @ 0x70 ....... %s\n", ping(MUX_ADDR) ? "PRESENT" : "MISSING");
-  Serial.printf("  LEFT  AS5600 ch6 ...... %s\n", leftOk  ? "PRESENT" : "MISSING");
-  Serial.printf("  RIGHT AS5600 ch3 ...... %s\n", rightOk ? "PRESENT" : "MISSING");
-  Serial.println(F("  ready -- see README for the command set"));
-  Serial.println(F("=========================================\n"));
+  Out.println(F("\n================ SUMMARY ================"));
+  Out.printf("  PCA9548A @ 0x70 ....... %s\n", ping(MUX_ADDR) ? "PRESENT" : "MISSING");
+  Out.printf("  LEFT  AS5600 ch6 ...... %s\n", leftOk  ? "PRESENT" : "MISSING");
+  Out.printf("  RIGHT AS5600 ch3 ...... %s\n", rightOk ? "PRESENT" : "MISSING");
+  Out.println(F("  ready -- see README for the command set"));
+  Out.println(F("=========================================\n"));
 }
 
 static void runAll() {
@@ -724,7 +749,7 @@ static void runAll() {
 
 // ---------------------------------------------------------------- telemetry
 static void sendTelem() {
-  Serial.printf("D,%lld,%lld,%.0f,%d,%lu,%lld,%lld,%.0f,%d,%lu,%d,%d\n",
+  Out.printf("D,%lld,%lld,%.0f,%d,%lu,%lld,%lld,%.0f,%d,%lu,%d,%d\n",
                 (long long)WL.pos, (long long)WL.target, WL.vel, WL.duty, WL.errCount,
                 (long long)WR.pos, (long long)WR.target, WR.vel, WR.duty, WR.errCount,
                 WL.mode, WR.mode);
@@ -734,7 +759,7 @@ static void sendStatus() {
   int la = -1, lst = -1, ra = -1, rst = -1;
   if (muxWrite(MASK_LEFT))  { delayMicroseconds(300); lst = as5600Read8(AS_STATUS); la = as5600Read8(AS_AGC); }
   if (muxWrite(MASK_RIGHT)) { delayMicroseconds(300); rst = as5600Read8(AS_STATUS); ra = as5600Read8(AS_AGC); }
-  Serial.printf("S,%d,%d,%d,%d,%.3f,%.3f,%.4f,%d,%d,%d,%d,%d,%.2f,%.2f\n",
+  Out.printf("S,%d,%d,%d,%d,%.3f,%.3f,%.4f,%d,%d,%d,%d,%d,%.2f,%.2f\n",
                 la, lst, ra, rst, Kp, Ki, Kd, POS_TOL,
                 WL.minDutyFwd, WL.minDutyRev, WR.minDutyFwd, WR.minDutyRev,
                 WL.slope, WR.slope);
@@ -768,7 +793,7 @@ static void moveCounts(Wheel &w, int64_t delta) {
     w.approachStage = 0;
     startMove(w, tgt);
   }
-  Serial.printf("ACK,move,%s,%.2f\n", w.name, delta * 360.0f / CPR);
+  Out.printf("ACK,move,%s,%.2f\n", w.name, delta * 360.0f / CPR);
 }
 
 static void moveBy(Wheel &w, float degrees) {
@@ -784,7 +809,7 @@ static void driveMetres(float m) {
   int64_t c = (int64_t)lroundf(m * CPM);
   moveCounts(WL, c);
   moveCounts(WR, c);
-  Serial.printf("ACK,drive,%.4f,%lld\n", m, (long long)c);
+  Out.printf("ACK,drive,%.4f,%lld\n", m, (long long)c);
 }
 
 // Turn in place: the wheels counter-rotate along a circle of diameter TRACK,
@@ -792,14 +817,14 @@ static void driveMetres(float m) {
 // above: left wheel back, right wheel forward.
 static bool turnDegrees(float deg) {
   if (TRACK_MM <= 0) {
-    Serial.println(F("ERR,track,set TRACK <mm> first -- a turn cannot be computed without it"));
+    Out.println(F("ERR,track,set TRACK <mm> first -- a turn cannot be computed without it"));
     return false;
   }
   float arc = (TRACK_MM / 2000.0f) * deg * (float)M_PI / 180.0f;   // metres
   int64_t c = (int64_t)lroundf(arc * CPM);
   moveCounts(WL, -c);
   moveCounts(WR, +c);
-  Serial.printf("ACK,turn,%.2f,%lld\n", deg, (long long)c);
+  Out.printf("ACK,turn,%.2f,%lld\n", deg, (long long)c);
   return true;
 }
 
@@ -815,6 +840,112 @@ static void updatePose() {
   poseX += dc * cos(poseTh + dth / 2.0);
   poseY += dc * sin(poseTh + dth / 2.0);
   poseTh += dth;
+}
+
+// ---------------------------------------------------------------- wifi
+// Credentials live in NVS, never in source: this repository is public, and a
+// hardcoded SSID and password would be published and indexed. Set them once
+// over USB with:  WIFI <ssid> <password>
+static bool wifiEnabled = false;
+static bool wifiIsAP = false;
+
+static void serverStart() {
+  tcpServer.begin();
+  tcpServer.setNoDelay(true);      // telemetry is small and frequent
+  ArduinoOTA.setHostname("drive-harness");
+  ArduinoOTA.onStart([]() {        // never flash while a wheel is turning
+    stopAll();
+    Out.println(F("OTA,start"));
+  });
+  ArduinoOTA.onEnd([]() { Out.println(F("OTA,done")); });
+  ArduinoOTA.begin();
+}
+
+static void wifiStart() {
+  prefs.begin("drive", true);
+  String ssid = prefs.getString("ssid", "");
+  String pass = prefs.getString("pass", "");
+  uint8_t wmode = prefs.getUChar("wmode", 1);    // 1 = join a network, 2 = be one
+  prefs.end();
+
+  if (!ssid.length()) {
+    Out.println(F("WIFI,none,set with: WIFIAP <ssid> <password>  (or WIFI <ssid> <password> to join a router)"));
+    return;
+  }
+
+  if (wmode == 2) {
+    // Access point: the car carries its own network, so it works anywhere and
+    // the address never changes. WPA2 needs 8+ characters; shorter means open.
+    WiFi.mode(WIFI_AP);
+    WiFi.setSleep(false);
+    // Deliberately NOT the 192.168.4.x default: that subnet collides with
+    // static routes on this laptop's wired network, so traffic for the bot got
+    // routed out of the ethernet port instead of over WiFi.
+    WiFi.softAPConfig(IPAddress(10, 42, 7, 1), IPAddress(10, 42, 7, 1),
+                      IPAddress(255, 255, 255, 0));
+    bool ok = (pass.length() >= 8)
+                ? WiFi.softAP(ssid.c_str(), pass.c_str())
+                : WiFi.softAP(ssid.c_str());
+    if (ok) {
+      wifiEnabled = true;
+      wifiIsAP = true;
+      serverStart();
+      Out.printf("WIFI,ap,%s,%s,%d,%s\n", ssid.c_str(),
+                 WiFi.softAPIP().toString().c_str(), TCP_PORT,
+                 pass.length() >= 8 ? "wpa2" : "OPEN");
+    } else {
+      Out.println(F("WIFI,failed,softAP did not start -- USB serial still works"));
+    }
+    return;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);            // sleep adds latency spikes to the link
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  Out.printf("WIFI,connecting,%s\n", ssid.c_str());
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) delay(200);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiEnabled = true;
+    wifiIsAP = false;
+    serverStart();
+    Out.printf("WIFI,ok,%s,%d,%d\n", WiFi.localIP().toString().c_str(),
+               TCP_PORT, WiFi.RSSI());
+  } else {
+    Out.println(F("WIFI,failed,continuing on USB serial only"));
+  }
+}
+
+// Link-loss failsafe. A car that keeps executing its last command after losing
+// contact is how hardware gets broken.
+static void wifiService() {
+  if (!wifiEnabled) return;
+  ArduinoOTA.handle();
+
+  if (!tcpClient || !tcpClient.connected()) {
+    if (tcpClient) {                       // a client just went away
+      tcpClient.stop();
+      if (WL.mode != 0 || WR.mode != 0) {
+        stopAll();
+        Out.println(F("FAULT,link,client lost -- motors stopped"));
+      }
+    }
+    WiFiClient c = tcpServer.available();
+    if (c) {
+      tcpClient = c;
+      tcpClient.setNoDelay(true);
+      Out.printf("LINK,up,%s\n", tcpClient.remoteIP().toString().c_str());
+    }
+  }
+
+  // In AP mode there is no upstream link to lose, so WiFi.status() is not
+  // meaningful -- the client-disconnect check above is the failsafe there.
+  if (!wifiIsAP && WiFi.status() != WL_CONNECTED && (WL.mode != 0 || WR.mode != 0)) {
+    stopAll();
+    Out.println(F("FAULT,link,wifi dropped -- motors stopped"));
+  }
 }
 
 static void geomSave() {
@@ -834,7 +965,7 @@ static void handleLine(String line) {
     if (c == 't') { telem = !telem; return; }
     if (c == 'r') { stopAll(); runAll(); return; }
     if (c == 'm') { stopAll(); mappingTest(); return; }
-    if (c == 'x' || c == 's') { stopAll(); Serial.println(F("ACK,stop")); return; }
+    if (c == 'x' || c == 's') { stopAll(); Out.println(F("ACK,stop")); return; }
     if (c >= '1' && c <= '4') { stopAll(); mapPin(c - '1'); return; }
   }
 
@@ -858,10 +989,10 @@ static void handleLine(String line) {
     moveBy(WR, d);
   } else if (cmd == "D" && n >= 3) {          // D <L|R> <-255..255>  open loop
     Wheel *w = pickWheel(tok[1]);
-    if (w) { w->mode = 1; applyDuty(*w, tok[2].toInt()); Serial.printf("ACK,duty,%s,%d\n", w->name, w->duty); }
+    if (w) { w->mode = 1; applyDuty(*w, tok[2].toInt()); Out.printf("ACK,duty,%s,%d\n", w->name, w->duty); }
   } else if (cmd == "V" && n >= 3) {          // V <L|R> <counts/s>
     Wheel *w = pickWheel(tok[1]);
-    if (w) { w->mode = 3; w->integ = 0; w->velTarget = tok[2].toFloat(); Serial.printf("ACK,vel,%s,%.0f\n", w->name, w->velTarget); }
+    if (w) { w->mode = 3; w->integ = 0; w->velTarget = tok[2].toFloat(); Out.printf("ACK,vel,%s,%.0f\n", w->name, w->velTarget); }
   } else if (cmd == "C" && n >= 2) {          // C <L|R>  calibrate
     Wheel *w = pickWheel(tok[1]);
     if (w) calibrate(*w);
@@ -870,70 +1001,117 @@ static void handleLine(String line) {
     // Kv is clamped: the sweep measured 258 deg of overshoot at Kv 0.14, so
     // values above the stable ceiling are not accepted from the console.
     if (n >= 5) Kv = constrain(tok[4].toFloat(), 0.0f, 0.070f);
-    Serial.printf("ACK,gains,%.3f,%.3f,%.4f,%.4f\n", Kp, Ki, Kd, Kv);
+    Out.printf("ACK,gains,%.3f,%.3f,%.4f,%.4f\n", Kp, Ki, Kd, Kv);
   } else if (cmd == "APPROACH" && n >= 3) {   // APPROACH <0|1|-1> <takeup>
     APPROACH_DIR = tok[1].toInt();
     TAKEUP = tok[2].toInt();
-    Serial.printf("ACK,approach,%d,%d\n", APPROACH_DIR, TAKEUP);
+    Out.printf("ACK,approach,%d,%d\n", APPROACH_DIR, TAKEUP);
   } else if (cmd == "TOL" && n >= 2) {
     POS_TOL = tok[1].toInt();
-    Serial.printf("ACK,tol,%d\n", POS_TOL);
+    Out.printf("ACK,tol,%d\n", POS_TOL);
   } else if (cmd == "PROF" && n >= 3) {       // PROF <vmax> <amax>
     VMAX = tok[1].toFloat();
     AMAX = tok[2].toFloat();
-    Serial.printf("ACK,prof,%.0f,%.0f\n", VMAX, AMAX);
+    Out.printf("ACK,prof,%.0f,%.0f\n", VMAX, AMAX);
   } else if (cmd == "TRACE") {
     traceArmed = !traceArmed;
     traceCount = 0;
     traceW = nullptr;
-    Serial.printf("ACK,trace,%d\n", traceArmed ? 1 : 0);
+    Out.printf("ACK,trace,%d\n", traceArmed ? 1 : 0);
   } else if (cmd == "DUMP") {
-    Serial.printf("TRC,%u,%lld\n", traceCount, (long long)traceTargetRel);
+    Out.printf("TRC,%u,%lld\n", traceCount, (long long)traceTargetRel);
     for (uint16_t i = 0; i < traceCount; i += 20) {
-      Serial.printf("TD,%u", i);
+      Out.printf("TD,%u", i);
       for (uint16_t j = i; j < i + 20 && j < traceCount; j++)
-        Serial.printf(",%ld", (long)traceBuf[j]);
-      Serial.println();
+        Out.printf(",%ld", (long)traceBuf[j]);
+      Out.println();
     }
-    Serial.println(F("TRCEND"));
+    Out.println(F("TRCEND"));
   } else if (cmd == "DRIVE" && n >= 2) {      // DRIVE <metres>
     driveMetres(tok[1].toFloat());
   } else if (cmd == "TURN" && n >= 2) {       // TURN <degrees, +ve = CCW>
     turnDegrees(tok[1].toFloat());
+  } else if (cmd == "SPIN" && n >= 2) {
+    // In-place turn expressed in WHEEL degrees, not robot heading. Needs no
+    // geometry, so it works before TRACK has been measured -- the wheels
+    // counter-rotate by a known amount even if the resulting heading change
+    // is not yet known.
+    float d = tok[1].toFloat();
+    int64_t c = (int64_t)lroundf(d * CPR / 360.0f);
+    moveCounts(WL, -c);
+    moveCounts(WR, +c);
+    Out.printf("ACK,spin,%.2f\n", d);
   } else if (cmd == "POSE") {
-    Serial.printf("POSE,%.4f,%.4f,%.2f,%.4f,%.4f\n", poseX, poseY,
+    Out.printf("POSE,%.4f,%.4f,%.2f,%.4f,%.4f\n", poseX, poseY,
                   poseTh * 180.0 / M_PI, WL.pos / (double)CPM, WR.pos / (double)CPM);
   } else if (cmd == "POSERST") {
     poseX = poseY = poseTh = 0;
     lastPoseL = WL.pos;
     lastPoseR = WR.pos;
-    Serial.println(F("ACK,posrst"));
+    Out.println(F("ACK,posrst"));
   } else if (cmd == "CPM" && n >= 2) {
     CPM = tok[1].toFloat();
     geomSave();
-    Serial.printf("ACK,cpm,%.1f\n", CPM);
+    Out.printf("ACK,cpm,%.1f\n", CPM);
   } else if (cmd == "TRACK" && n >= 2) {
     TRACK_MM = tok[1].toFloat();
     geomSave();
-    Serial.printf("ACK,track,%.1f\n", TRACK_MM);
+    Out.printf("ACK,track,%.1f\n", TRACK_MM);
   } else if (cmd == "CALDIST" && n >= 2) {    // CALDIST <actual metres travelled>
     float actual = tok[1].toFloat();
     if (lastDriveM != 0 && actual > 0) {
       float old = CPM;
       CPM = CPM * (lastDriveM / actual);      // travelled too far -> fewer counts/m
       geomSave();
-      Serial.printf("ACK,caldist,%.1f,%.1f,%.2f\n", old, CPM,
+      Out.printf("ACK,caldist,%.1f,%.1f,%.2f\n", old, CPM,
                     (CPM - old) / old * 100.0f);
     } else {
-      Serial.println(F("ERR,caldist,run DRIVE <m> first, then pass the measured distance"));
+      Out.println(F("ERR,caldist,run DRIVE <m> first, then pass the measured distance"));
     }
+  } else if ((cmd == "WIFI" || cmd == "WIFIAP") && n >= 3) {
+    // Password may contain spaces, so take everything after the SSID verbatim
+    // rather than relying on the tokeniser.
+    int sp1 = line.indexOf(' ');
+    int sp2 = line.indexOf(' ', sp1 + 1);
+    String ssid = line.substring(sp1 + 1, sp2);
+    String pass = line.substring(sp2 + 1);
+    uint8_t wmode = (cmd == "WIFIAP") ? 2 : 1;
+    prefs.begin("drive", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    prefs.putUChar("wmode", wmode);
+    prefs.end();
+    Out.printf("ACK,wifi,%s,%s,%d chars,reboot to apply\n",
+               wmode == 2 ? "ap" : "station", ssid.c_str(), pass.length());
+    if (wmode == 2 && pass.length() < 8)
+      Out.println(F("WARN,ap password under 8 chars -- the network will be OPEN"));
+  } else if (cmd == "WIFIQ") {
+    Out.printf("WIFI,%s,%s,%s,%d,%s,%d\n",
+               wifiEnabled ? (wifiIsAP ? "ap" : "station") : "down",
+               wifiEnabled ? (wifiIsAP ? WiFi.softAPIP().toString().c_str()
+                                       : WiFi.localIP().toString().c_str()) : "-",
+               wifiIsAP ? "-" : String(WiFi.RSSI()).c_str(),
+               wifiIsAP ? WiFi.softAPgetStationNum() : 0,
+               (tcpClient && tcpClient.connected()) ? "client" : "noclient",
+               TCP_PORT);
+  } else if (cmd == "WIFICLR") {
+    prefs.begin("drive", false);
+    prefs.remove("ssid");
+    prefs.remove("pass");
+    prefs.end();
+    Out.println(F("ACK,wificlr,reboot to apply"));
+  } else if (cmd == "REBOOT") {
+    stopAll();
+    Out.println(F("ACK,reboot"));
+    delay(120);
+    ESP.restart();
   } else if (cmd == "GEOM") {
-    Serial.printf("GEOM,%.1f,%.1f,%.4f\n", CPM, TRACK_MM, lastDriveM);
+    Out.printf("GEOM,%.1f,%.1f,%.4f\n", CPM, TRACK_MM, lastDriveM);
   } else if (cmd == "CALQ") {                 // report calibration state on demand
-    Serial.printf("CALLOAD,L,%d,%d,%d,%.2f\n",
+    Out.printf("CALLOAD,L,%d,%d,%d,%.2f\n",
                   (WL.minDutyFwd > 0 && WL.minDutyRev > 0) ? 1 : 0,
                   WL.minDutyFwd, WL.minDutyRev, WL.slope);
-    Serial.printf("CALLOAD,R,%d,%d,%d,%.2f\n",
+    Out.printf("CALLOAD,R,%d,%d,%d,%.2f\n",
                   (WR.minDutyFwd > 0 && WR.minDutyRev > 0) ? 1 : 0,
                   WR.minDutyFwd, WR.minDutyRev, WR.slope);
   } else if (cmd == "CALCLR") {               // forget stored calibration
@@ -942,17 +1120,17 @@ static void handleLine(String line) {
     prefs.end();
     WL.minDutyFwd = WL.minDutyRev = WR.minDutyFwd = WR.minDutyRev = 0;
     WL.slope = WR.slope = 0;
-    Serial.println(F("ACK,calclr"));
+    Out.println(F("ACK,calclr"));
   } else if (cmd == "Z") {                    // zero both positions
     WL.pos = WL.target = 0; WR.pos = WR.target = 0;
-    Serial.println(F("ACK,zero"));
+    Out.println(F("ACK,zero"));
   } else if (cmd == "X") {
     stopAll();
-    Serial.println(F("ACK,stop"));
+    Out.println(F("ACK,stop"));
   } else if (cmd == "T") {
     telem = !telem;
   } else {
-    Serial.printf("ERR,unknown,%s\n", line.c_str());
+    Out.printf("ERR,unknown,%s\n", line.c_str());
   }
 }
 
@@ -968,24 +1146,25 @@ void setup() {
   delay(400);
   Wire.begin(PIN_SDA, PIN_SCL, 400000);
 
-  Serial.println(F("\n\n########## DRIVE HARNESS ##########"));
-  Serial.println(F("Motor rail live, EN strapped to VCC -- drivers always enabled."));
+  Out.println(F("\n\n########## DRIVE HARNESS ##########"));
+  Out.println(F("Motor rail live, EN strapped to VCC -- drivers always enabled."));
 
   prefs.begin("drive", true);
   CPM = prefs.getFloat("cpm", CPM);
   TRACK_MM = prefs.getFloat("track", 0.0f);
   prefs.end();
-  Serial.printf("GEOM,%.1f,%.1f,0.0\n", CPM, TRACK_MM);
+  Out.printf("GEOM,%.1f,%.1f,0.0\n", CPM, TRACK_MM);
   if (TRACK_MM <= 0)
-    Serial.println(F("WARNING: TRACK not set -- TURN and pose are unavailable. Use: TRACK <mm>"));
+    Out.println(F("WARNING: TRACK not set -- TURN and pose are unavailable. Use: TRACK <mm>"));
 
   bool cl = calLoad(WL), cr = calLoad(WR);
-  Serial.printf("CALLOAD,L,%d,%d,%d,%.2f\n", cl ? 1 : 0, WL.minDutyFwd, WL.minDutyRev, WL.slope);
-  Serial.printf("CALLOAD,R,%d,%d,%d,%.2f\n", cr ? 1 : 0, WR.minDutyFwd, WR.minDutyRev, WR.slope);
+  Out.printf("CALLOAD,L,%d,%d,%d,%.2f\n", cl ? 1 : 0, WL.minDutyFwd, WL.minDutyRev, WL.slope);
+  Out.printf("CALLOAD,R,%d,%d,%d,%.2f\n", cr ? 1 : 0, WR.minDutyFwd, WR.minDutyRev, WR.slope);
   if (!cl || !cr)
-    Serial.println(F("WARNING: not calibrated -- run C L and C R, or moves will undershoot."));
+    Out.println(F("WARNING: not calibrated -- run C L and C R, or moves will undershoot."));
 
   runAll();
+  wifiStart();
 }
 
 void loop() {
@@ -995,7 +1174,17 @@ void loop() {
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') { handleLine(buf); buf = ""; }
-    else if (buf.length() < 60) buf += c;
+    else if (buf.length() < 90) buf += c;
+  }
+
+  wifiService();
+  static String tbuf;
+  if (tcpClient && tcpClient.connected()) {
+    while (tcpClient.available()) {
+      char c = tcpClient.read();
+      if (c == '\n' || c == '\r') { handleLine(tbuf); tbuf = ""; }
+      else if (tbuf.length() < 90) tbuf += c;
+    }
   }
 
   uint32_t now = micros();

@@ -9,7 +9,9 @@ telemetry, where the wheel moves ~70 deg between samples at top speed.
 
     python3 analyze_moves.py [port] [--csv DIR]
 """
-import sys, time, os, serial
+import sys, time, os
+
+from link import connect_and_sync
 
 port = "/dev/ttyUSB0"
 csvdir = None
@@ -21,9 +23,7 @@ for i, a in enumerate(args):
         port = a
 
 CPR = 4096.0
-s = serial.Serial(port, 115200, timeout=0.1)
-s.setDTR(False); s.setRTS(True); time.sleep(0.15); s.setRTS(False)
-time.sleep(5.5); s.reset_input_buffer()
+s, _was_reset = connect_and_sync(port)
 buf = b""
 
 

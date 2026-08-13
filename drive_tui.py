@@ -21,7 +21,7 @@ import tty
 import select
 from collections import deque
 
-import serial
+from link import connect_and_sync
 from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
@@ -33,10 +33,10 @@ from rich.align import Align
 CPR = 4096.0
 
 HELP = [
-    ("tab", "select wheel"), ("h / l", "rotate -15 / +15"),
-    ("j / k", "rotate -90 / +90"), ("J / K", "rotate -360 / +360"),
-    ("w / s", "duty +10 / -10"), ("space", "STOP"),
-    ("z", "zero position"), ("c", "calibrate"),
+    ("↑ ↓", "drive fwd/back"), ("← →", "turn left/right"),
+    ("+ -", "step ±5 cm"), ("[ ]", "turn step ±5°"),
+    ("space", "STOP"), ("tab", "select wheel"),
+    ("j / k", "wheel ∓90°"), ("z", "zero"), ("c", "calibrate"),
     (":", "command"), ("q", "quit"),
 ]
 
@@ -64,6 +64,7 @@ class Link(threading.Thread):
         self.s = {}                      # latest S, status frame
         self.log = deque(maxlen=200)
         self.cal = {"L": {}, "R": {}}
+        self.geom = {"cpm": 10905.0, "track": 0.0}
         self.moves = {"L": deque(maxlen=12), "R": deque(maxlen=12)}
         self.pending = {"L": None, "R": None}
         self.rate = 0.0
@@ -83,21 +84,16 @@ class Link(threading.Thread):
 
     def run(self):
         try:
-            self.ser = serial.Serial(self.port, 115200, timeout=0.1)
+            self.log.append(("sys", f"connecting to {self.port}"))
+            self.ser, was_reset = connect_and_sync(self.port)
         except Exception as e:
             self.log.append(("err", f"open {self.port}: {e}"))
+            self.write_log("ERR", f"open {self.port}: {e}")
             return
-
-        self.ser.setDTR(False)
-        self.ser.setRTS(True)
-        time.sleep(0.15)
-        self.ser.setRTS(False)
-        time.sleep(0.05)
-        self.ser.reset_input_buffer()
-        self.log.append(("sys", "board reset, waiting for boot scan"))
-        time.sleep(5.5)
-        self.ser.reset_input_buffer()
+        self.log.append(("sys", "board reset, boot scan done" if was_reset
+                         else "attached over network, board already running"))
         self.connected = True
+        self.send("GEOM")                # learn cpm/track so steering knows its mode
         self.send("T")                   # telemetry on
 
         buf = b""
@@ -187,6 +183,13 @@ class Link(threading.Thread):
                 c["running"] = False
             self.log.append(("cal", line))
 
+        elif tag == "GEOM" and len(p) >= 3:
+            try:
+                self.geom = {"cpm": float(p[1]), "track": float(p[2])}
+            except ValueError:
+                pass
+            self.log.append(("rx", line))
+
         elif tag == "ERR":
             self.log.append(("err", line))
         else:
@@ -221,6 +224,8 @@ class App:
         self.cmd = ""
         self.quit = False
         self.port = port
+        self.step_m = 0.20          # metres per arrow press
+        self.step_deg = 15.0        # degrees per arrow press
 
     # ------------------------------------------------------------- rendering
     def wheel_panel(self, w):
@@ -327,8 +332,14 @@ class App:
                          border_style="cyan",
                          title="[bold]command[/]  (p <deg> · v <cts/s> · d <duty> · k <kp> <ki> <kd> · tol <n>)")
         s = self.link.s
+        track = self.link.geom.get("track", 0)
+        turn_mode = f"TURN {self.step_deg:.0f}°" if track > 0 else \
+                    f"SPIN {self.step_deg:.0f}° wheel (TRACK unset)"
+        drive = (f"step {self.step_m*100:.0f} cm   {turn_mode}"
+                 f"   cpm {self.link.geom.get('cpm', 0):.0f}")
         gains = (f"Kp {s.get('kp', 0):.3f}   Ki {s.get('ki', 0):.3f}   "
                  f"Kd {s.get('kd', 0):.4f}   tol {s.get('tol', 0)} cts") if s else "gains —"
+        gains = drive + "      " + gains
         keys = "   ".join(f"[bold cyan]{k}[/] {v}" for k, v in HELP)
         return Panel(Group(Text.from_markup(f"[grey58]{gains}[/]"), Text.from_markup(keys)),
                      border_style="grey35")
@@ -356,6 +367,21 @@ class App:
         return lay
 
     # ------------------------------------------------------------- input
+    # ---- driving -------------------------------------------------------
+    def forward(self, sign):
+        self.link.send(f"DRIVE {sign * self.step_m:.3f}")
+
+    def steer(self, sign):
+        """
+        Left/right. With TRACK measured this is a real heading change; without
+        it, fall back to SPIN, which counter-rotates the wheels by a known
+        amount but cannot know the resulting heading.
+        """
+        if self.link.geom.get("track", 0) > 0:
+            self.link.send(f"TURN {sign * self.step_deg:.1f}")
+        else:
+            self.link.send(f"SPIN {sign * self.step_deg:.1f}")
+
     def rotate(self, deg):
         self.link.send(f"P {self.sel} {deg}")
 
@@ -379,8 +405,34 @@ class App:
                 self.cmd += ch
             return
 
+        # Arrow keys arrive as ESC [ A/B/C/D, so pull the rest of the sequence.
+        if ch == "\x1b":
+            seq = ""
+            for _ in range(2):
+                r, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if not r:
+                    break
+                seq += sys.stdin.read(1)
+            if seq == "[A":
+                self.forward(+1)
+            elif seq == "[B":
+                self.forward(-1)
+            elif seq == "[D":
+                self.steer(+1)      # left is counter-clockwise, positive
+            elif seq == "[C":
+                self.steer(-1)
+            return
+
         if ch == "q":
             self.quit = True
+        elif ch == "+" or ch == "=":
+            self.step_m = min(2.0, self.step_m + 0.05)
+        elif ch == "-":
+            self.step_m = max(0.05, self.step_m - 0.05)
+        elif ch == "]":
+            self.step_deg = min(180.0, self.step_deg + 5)
+        elif ch == "[":
+            self.step_deg = max(5.0, self.step_deg - 5)
         elif ch == "\t":
             self.sel = "R" if self.sel == "L" else "L"
         elif ch == " ":
