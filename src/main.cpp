@@ -1,28 +1,28 @@
-// drive-harness-diag — connection verifier for the ESP32 / PCA9548A / AS5600 / BTS7960 harness.
+// drive-harness-diag -- bring-up, closed-loop control and calibration for the
+// ESP32 / BTS7960 / AS5600 / PCA9548A drive harness.
 //
-// Safety: the motor rail is live. Every driver pin is forced LOW before anything
-// else runs, and nothing in the automatic test sequence ever raises them. Motor
-// motion happens only on an explicit serial command.
+// Safety: the motor rail is live and R_EN/L_EN are strapped to VCC, so both
+// drivers are permanently enabled. Only the PWM duty being zero keeps the
+// motors still. Every path that ends a move drives duty to zero.
 
 #include <Arduino.h>
 #include <Wire.h>
 
-// ---- harness pin map (matches the wiring reference) ----
+// ---- harness pin map ----
 #define PIN_SDA        21
 #define PIN_SCL        22
 #define PIN_MUX_RESET   5
 
-// AS BUILT, verified by the [M] mapping test on 2026-08-13 -- the two driver
-// connectors are on the opposite GPIOs from the original wiring reference.
-// Do not "correct" these back to 25/26=left without re-running [M].
-//   GPIO 32/33 -> LEFT  driver   (encoder ch6 responds)
-//   GPIO 25/26 -> RIGHT driver   (encoder ch3 responds)
-// RPWM on either side produces increasing encoder counts.
+// AS BUILT, verified by the mapping test -- the two driver connectors are on
+// the opposite GPIOs from the original wiring reference. Do not "correct"
+// these back to 25/26 = left without re-running the mapping test.
+//   GPIO 32/33 -> LEFT  driver   (encoder on mux channel 6)
+//   GPIO 25/26 -> RIGHT driver   (encoder on mux channel 3)
+// RPWM produces increasing encoder counts on both sides.
 #define PIN_L_RPWM     32
 #define PIN_L_LPWM     33
 #define PIN_R_RPWM     25
 #define PIN_R_LPWM     26
-#define PIN_EN         27   // NOT CONNECTED -- R_EN/L_EN are strapped to VCC
 
 #define MUX_ADDR     0x70
 #define ENC_ADDR     0x36
@@ -35,16 +35,39 @@
 #define AS_AGC       0x1A
 #define AS_MAGNITUDE 0x1B
 
-static bool leftOk = false, rightOk = false;
+#define CPR          4096.0f          // counts per revolution
+#define LOOP_US      5000             // 200 Hz control loop
 
-static void killDrive() {
-  pinMode(PIN_EN, OUTPUT);     digitalWrite(PIN_EN, LOW);
-  pinMode(PIN_L_RPWM, OUTPUT); digitalWrite(PIN_L_RPWM, LOW);
-  pinMode(PIN_L_LPWM, OUTPUT); digitalWrite(PIN_L_LPWM, LOW);
-  pinMode(PIN_R_RPWM, OUTPUT); digitalWrite(PIN_R_RPWM, LOW);
-  pinMode(PIN_R_LPWM, OUTPUT); digitalWrite(PIN_R_LPWM, LOW);
+// ---- PWM ----
+// One LEDC channel per driver input, set up once and never detached, so the
+// diagnostics and the control loop cannot fight over the GPIO matrix.
+static const uint8_t PWM_PIN[4] = { PIN_L_RPWM, PIN_L_LPWM, PIN_R_RPWM, PIN_R_LPWM };
+static const char   *PWM_NAME[4] = { "LEFT  RPWM", "LEFT  LPWM", "RIGHT RPWM", "RIGHT LPWM" };
+static bool pwmReady = false;
+
+static void pwmInit() {
+  if (pwmReady) return;
+  for (uint8_t i = 0; i < 4; i++) {
+    ledcSetup(i, 15000, 8);
+    ledcAttachPin(PWM_PIN[i], i);
+    ledcWrite(i, 0);
+  }
+  pwmReady = true;
 }
 
+static inline void pwmSet(uint8_t idx, int duty) {
+  ledcWrite(idx, constrain(duty, 0, 255));
+}
+
+static void killDrive() {
+  if (!pwmReady) {                      // before LEDC exists, force the pins low
+    for (uint8_t i = 0; i < 4; i++) { pinMode(PWM_PIN[i], OUTPUT); digitalWrite(PWM_PIN[i], LOW); }
+    return;
+  }
+  for (uint8_t i = 0; i < 4; i++) ledcWrite(i, 0);
+}
+
+// ---- I2C primitives ----
 static bool ping(uint8_t addr) {
   Wire.beginTransmission(addr);
   return Wire.endTransmission() == 0;
@@ -78,7 +101,220 @@ static int as5600Read12(uint8_t reg) {
   return ((hi << 8) | lo) & 0x0FFF;
 }
 
-// ---------------------------------------------------------------- test 1
+// GPIO 5 -> mux RESET is not connected on this build, so a latched channel has
+// no hardware recovery. This clocks SCL by hand to free a slave that is holding
+// SDA low, then re-inits the peripheral -- the software stand-in for RESET.
+static void i2cRecover() {
+  Wire.end();
+  pinMode(PIN_SCL, OUTPUT);
+  pinMode(PIN_SDA, INPUT_PULLUP);
+  for (uint8_t i = 0; i < 9; i++) {
+    digitalWrite(PIN_SCL, HIGH); delayMicroseconds(5);
+    digitalWrite(PIN_SCL, LOW);  delayMicroseconds(5);
+  }
+  digitalWrite(PIN_SCL, HIGH);
+  delayMicroseconds(5);
+  Wire.begin(PIN_SDA, PIN_SCL, 400000);
+  muxWrite(0x00);
+}
+
+// ---------------------------------------------------------------- wheels
+struct Wheel {
+  Wheel(const char *n, uint8_t f, uint8_t r, uint8_t m)
+    : name(n), idxFwd(f), idxRev(r), mask(m) {}
+
+  const char *name;
+  uint8_t idxFwd, idxRev;     // LEDC channel indices: +duty and -duty
+  uint8_t mask;
+
+  int      lastRaw = -1;
+  bool     haveRaw = false;
+  int64_t  pos = 0;           // unwrapped counts, survives many revolutions
+  int64_t  target = 0;
+  float    vel = 0;           // counts/s, low-pass filtered
+  int      duty = 0;          // signed, -255..255
+  uint32_t errCount = 0;
+
+  float    integ = 0, prevErr = 0;
+  bool     settled = true;
+  uint32_t settleStart = 0;
+
+  int      minDutyFwd = 0, minDutyRev = 0;   // measured stiction thresholds
+  float    slope = 0;                        // counts/s per duty unit
+
+  uint8_t  mode = 0;          // 0 idle, 1 raw duty, 2 position, 3 velocity
+  float    velTarget = 0;
+};
+
+static Wheel WL("L", 0, 1, MASK_LEFT);
+static Wheel WR("R", 2, 3, MASK_RIGHT);
+
+// Gains shared by both wheels, tuned live from the TUI. These defaults were
+// measured, not guessed: a sweep over Kp 0.35-0.80 found raising Kp made
+// settling worse (Kp 0.55 hunted and failed to settle on 3 of 6 moves), while
+// tightening POS_TOL from 8 to 2 cut mean settling error from 0.468 to 0.120
+// degrees. One count is 0.088 deg, so tol 2 sits just above the sensor floor.
+static float Kp = 0.35f, Ki = 0.40f, Kd = 0.004f;
+static int   POS_TOL = 2;          // counts, ~0.18 deg
+static bool  telem = false;
+
+static void applyDuty(Wheel &w, int d) {
+  d = constrain(d, -255, 255);
+  w.duty = d;
+  if (d >= 0) { pwmSet(w.idxRev, 0); pwmSet(w.idxFwd, d); }
+  else        { pwmSet(w.idxFwd, 0); pwmSet(w.idxRev, -d); }
+}
+
+static void stopWheel(Wheel &w) {
+  w.mode = 0;
+  w.integ = 0;
+  applyDuty(w, 0);
+}
+
+static void stopAll() { stopWheel(WL); stopWheel(WR); }
+
+// Read one encoder and fold the 12-bit wrap into an unbounded position.
+static void updateWheel(Wheel &w, float dt) {
+  if (!muxWrite(w.mask)) { w.errCount++; i2cRecover(); return; }
+  int raw = as5600Read12(AS_RAW_ANGLE);
+  if (raw < 0) { w.errCount++; return; }
+
+  if (!w.haveRaw) { w.lastRaw = raw; w.haveRaw = true; return; }
+
+  int d = raw - w.lastRaw;
+  if (d >  2048) d -= 4096;           // wrapped backwards past zero
+  if (d < -2048) d += 4096;           // wrapped forwards past full scale
+  w.lastRaw = raw;
+  w.pos += d;
+
+  float vraw = (dt > 0) ? d / dt : 0;
+  w.vel += 0.25f * (vraw - w.vel);    // light filter; raw is quantised and noisy
+}
+
+// PID with a stiction kick: below the measured deadband the motor makes no
+// torque at all, so a small proportional term would sit there humming.
+static void controlWheel(Wheel &w, float dt) {
+  if (w.mode == 2) {
+    float err = (float)(w.target - w.pos);
+    if (fabsf(err) <= POS_TOL && fabsf(w.vel) < 60) {
+      if (!w.settled) {
+        if (w.settleStart == 0) w.settleStart = millis();
+        else if (millis() - w.settleStart > 150) {
+          w.settled = true;
+          applyDuty(w, 0);
+          Serial.printf("DONE,%s,%lld,%.2f\n", w.name,
+                        (long long)(w.target - w.pos),
+                        (w.target - w.pos) * 360.0f / CPR);
+          w.mode = 0;
+          return;
+        }
+      }
+      applyDuty(w, 0);
+      return;
+    }
+    w.settleStart = 0;
+
+    w.integ += err * dt;
+    w.integ = constrain(w.integ, -4000.0f, 4000.0f);      // anti-windup
+    float deriv = (dt > 0) ? (err - w.prevErr) / dt : 0;
+    w.prevErr = err;
+
+    float u = Kp * err + Ki * w.integ + Kd * deriv;
+    int md = (u >= 0) ? w.minDutyFwd : w.minDutyRev;
+    if (md > 0 && fabsf(u) < md) u = (u >= 0 ? md : -md);  // kick past stiction
+    applyDuty(w, (int)constrain(u, -255.0f, 255.0f));
+
+  } else if (w.mode == 3) {
+    float err = w.velTarget - w.vel;
+    w.integ += err * dt;
+    w.integ = constrain(w.integ, -20000.0f, 20000.0f);
+    float ff = (w.slope > 1) ? w.velTarget / w.slope : 0;   // feedforward
+    float u = ff + 0.02f * err + 0.05f * w.integ * 0.01f;
+    applyDuty(w, (int)constrain(u, -255.0f, 255.0f));
+  }
+}
+
+// ---------------------------------------------------------------- calibration
+// Everything here is measured, not assumed: the duty at which the wheel
+// actually starts turning, and how counts/s scales with duty above it.
+
+// Calibration blocks the main loop, so it polls for an abort key itself --
+// otherwise a stop command would be ignored while a motor is spinning.
+static bool calAbort = false;
+
+static void calSettle(Wheel &w, uint32_t ms) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    while (Serial.available()) {
+      char c = Serial.read();
+      if (c == 'x' || c == 'X') { calAbort = true; applyDuty(w, 0); return; }
+    }
+    if (calAbort) { applyDuty(w, 0); return; }
+    updateWheel(w, LOOP_US / 1e6f);
+    delayMicroseconds(LOOP_US);
+  }
+}
+
+static float calMeasureVel(Wheel &w, uint32_t ms) {
+  int64_t p0 = w.pos;
+  uint32_t t0 = millis();
+  calSettle(w, ms);
+  float dt = (millis() - t0) / 1000.0f;
+  return (dt > 0) ? (w.pos - p0) / dt : 0;
+}
+
+static int findDeadband(Wheel &w, int sign) {
+  for (int d = 6; d <= 255 && !calAbort; d += 2) {
+    applyDuty(w, sign * d);
+    float v = calMeasureVel(w, 90);
+    if (fabsf(v) > 200) {                 // 200 counts/s ~ 3 deg per sample
+      applyDuty(w, 0);
+      calSettle(w, 250);
+      return d;
+    }
+  }
+  applyDuty(w, 0);
+  return 0;
+}
+
+static void calibrate(Wheel &w) {
+  Serial.printf("CALSTART,%s\n", w.name);
+  calAbort = false;
+  stopWheel(w);
+  calSettle(w, 200);
+
+  int fwd = findDeadband(w, +1);
+  int rev = findDeadband(w, -1);
+  w.minDutyFwd = fwd;
+  w.minDutyRev = rev;
+  Serial.printf("CALDEAD,%s,%d,%d\n", w.name, fwd, rev);
+
+  // duty -> speed curve, from just above the deadband to full scale
+  int lo = max(fwd, 20);
+  float sx = 0, sy = 0, sxx = 0, sxy = 0;
+  int n = 0;
+  for (int i = 0; i < 6 && !calAbort; i++) {
+    int d = lo + (255 - lo) * i / 5;
+    applyDuty(w, d);
+    calSettle(w, 320);                    // let it reach steady state
+    float v = calMeasureVel(w, 220);
+    Serial.printf("CALPT,%s,%d,%.1f\n", w.name, d, v);
+    sx += d; sy += v; sxx += (float)d * d; sxy += d * v; n++;
+  }
+  applyDuty(w, 0);
+  stopWheel(w);
+
+  if (calAbort) { Serial.printf("CALABORT,%s\n", w.name); calAbort = false; return; }
+
+  float denom = n * sxx - sx * sx;
+  w.slope = (n > 1 && fabsf(denom) > 1e-6f) ? (n * sxy - sx * sy) / denom : 0;
+  Serial.printf("CALSLOPE,%s,%.3f\n", w.name, w.slope);
+  Serial.printf("CALDONE,%s\n", w.name);
+}
+
+// ---------------------------------------------------------------- diagnostics
+static bool leftOk = false, rightOk = false;
+
 static void testUpstream() {
   Serial.println(F("\n[1] UPSTREAM BUS  (mux cleared -- only 0x70 should answer)"));
   muxWrite(0x00);
@@ -87,32 +323,26 @@ static void testUpstream() {
     if (ping(a)) {
       Serial.printf("      0x%02X responds", a);
       if (a == MUX_ADDR)      Serial.print(F("   <- PCA9548A, correct"));
-      else if (a == ENC_ADDR) Serial.print(F("   <- WRONG: an AS5600 is on the upstream bus, not behind the mux"));
+      else if (a == ENC_ADDR) Serial.print(F("   <- WRONG: an AS5600 is on the upstream bus"));
       Serial.println();
       found++;
     }
   }
-  if (!found) {
-    Serial.println(F("      nothing answered."));
-    Serial.println(F("      -> SDA/SCL swapped, mux unpowered, or no 4.7k pull-ups to 3V3."));
-  }
+  if (!found) Serial.println(F("      nothing answered -- SDA/SCL swapped, unpowered, or no pull-ups."));
 }
 
-// ---------------------------------------------------------------- test 2
 static void testMuxRegister() {
   Serial.println(F("\n[2] MUX CONTROL REGISTER  (write a mask, read it back)"));
-  const uint8_t masks[] = {0x00, MASK_LEFT, MASK_RIGHT, 0x00};
+  const uint8_t masks[] = { 0x00, MASK_LEFT, MASK_RIGHT, 0x00 };
   for (uint8_t i = 0; i < 4; i++) {
     bool w = muxWrite(masks[i]);
     delay(2);
     int rb = muxRead();
     Serial.printf("      wrote 0x%02X -> ack %s, read back 0x%02X  %s\n",
-                  masks[i], w ? "yes" : "NO ", rb,
-                  (w && rb == masks[i]) ? "ok" : "MISMATCH");
+                  masks[i], w ? "yes" : "NO ", rb, (w && rb == masks[i]) ? "ok" : "MISMATCH");
   }
 }
 
-// ---------------------------------------------------------------- test 3
 static void testResetPin() {
   Serial.println(F("\n[3] MUX RESET LINE  (GPIO 5 -- pulse low, register must clear)"));
   muxWrite(MASK_LEFT);
@@ -123,14 +353,12 @@ static void testResetPin() {
   digitalWrite(PIN_MUX_RESET, HIGH);
   delay(2);
   int after = muxRead();
-  Serial.printf("      before pulse 0x%02X, after pulse 0x%02X  -> %s\n",
-                before, after,
+  Serial.printf("      before 0x%02X, after 0x%02X  -> %s\n", before, after,
                 (before == MASK_LEFT && after == 0x00)
                   ? "RESET wired and working"
-                  : "RESET not effective (GPIO 5 not landing on the mux RESET pin)");
+                  : "RESET not effective (software i2cRecover() is the fallback)");
 }
 
-// ---------------------------------------------------------------- test 4
 static void scanAllChannels() {
   Serial.println(F("\n[4] PER-CHANNEL SCAN  (all 8, so a mis-plugged channel shows up)"));
   for (uint8_t ch = 0; ch < 8; ch++) {
@@ -139,21 +367,20 @@ static void scanAllChannels() {
     delay(2);
     bool enc = ping(ENC_ADDR);
     const char *tag = "";
-    if (mask == MASK_LEFT)  tag = enc ? "  <- LEFT, as designed" : "  <- LEFT expected here, MISSING";
-    if (mask == MASK_RIGHT) tag = enc ? "  <- RIGHT, as designed" : "  <- RIGHT expected here, MISSING";
-    if (enc && mask != MASK_LEFT && mask != MASK_RIGHT) tag = "  <- unexpected device on this channel";
+    if (mask == MASK_LEFT)  tag = enc ? "  <- LEFT, as designed" : "  <- LEFT expected, MISSING";
+    if (mask == MASK_RIGHT) tag = enc ? "  <- RIGHT, as designed" : "  <- RIGHT expected, MISSING";
+    if (enc && mask != MASK_LEFT && mask != MASK_RIGHT) tag = "  <- unexpected device";
     Serial.printf("      ch%d (mask 0x%02X)  %s%s\n", ch, mask,
                   enc ? "AS5600 @ 0x36 present" : "empty", tag);
-    if (mask == MASK_LEFT)  leftOk  = enc;
+    if (mask == MASK_LEFT)  leftOk = enc;
     if (mask == MASK_RIGHT) rightOk = enc;
   }
   muxWrite(0x00);
   delay(2);
-  Serial.printf("      isolation check: mask 0x00 -> 0x36 %s\n",
-                ping(ENC_ADDR) ? "STILL VISIBLE (mux not isolating)" : "gone, correct");
+  Serial.printf("      isolation: mask 0x00 -> 0x36 %s\n",
+                ping(ENC_ADDR) ? "STILL VISIBLE (not isolating)" : "gone, correct");
 }
 
-// ---------------------------------------------------------------- test 5
 static void encoderHealth(const char *name, uint8_t mask) {
   Serial.printf("\n      -- %s (mask 0x%02X) --\n", name, mask);
   if (!muxWrite(mask)) { Serial.println(F("      mux select failed")); return; }
@@ -162,108 +389,29 @@ static void encoderHealth(const char *name, uint8_t mask) {
   if (st < 0) { Serial.println(F("      no response from 0x36")); return; }
   bool md = st & 0x20, ml = st & 0x10, mh = st & 0x08;
   Serial.printf("      STATUS 0x0B = 0x%02X   MD=%d ML=%d MH=%d\n", st, md, ml, mh);
-  if (!md)      Serial.println(F("      -> NO MAGNET DETECTED. Magnet missing, too far, or not centred on the shaft."));
-  else if (ml)  Serial.println(F("      -> magnet too WEAK: move it closer (target ~1-2 mm)."));
-  else if (mh)  Serial.println(F("      -> magnet too STRONG: move it further away."));
-  else          Serial.println(F("      -> magnet detected and in range."));
-
-  int agc = as5600Read8(AS_AGC);
-  int mag = as5600Read12(AS_MAGNITUDE);
+  if (!md)     Serial.println(F("      -> NO MAGNET DETECTED."));
+  else if (ml) Serial.println(F("      -> magnet too WEAK: move it closer."));
+  else if (mh) Serial.println(F("      -> magnet too STRONG: move it further away."));
+  else         Serial.println(F("      -> magnet detected and in range."));
+  Serial.printf("      AGC 0x1A = %d  (aim for ~64 mid-scale at 3.3 V)\n", as5600Read8(AS_AGC));
+  Serial.printf("      MAGNITUDE = %d\n", as5600Read12(AS_MAGNITUDE));
   int raw = as5600Read12(AS_RAW_ANGLE);
-  Serial.printf("      AGC 0x1A = %d  (aim for ~64 mid-scale on a 3.3 V supply)\n", agc);
-  Serial.printf("      MAGNITUDE = %d\n", mag);
-  Serial.printf("      RAW_ANGLE 0x0C = %d  (%.1f deg)\n", raw, raw * 360.0 / 4096.0);
+  Serial.printf("      RAW_ANGLE 0x0C = %d  (%.1f deg)\n", raw, raw * 360.0 / CPR);
 }
 
 static void testEncoders() {
-  Serial.println(F("\n[5] ENCODER HEALTH  (magnet placement read from registers, not by eye)"));
-  if (leftOk)  encoderHealth("LEFT  ch6", MASK_LEFT);  else Serial.println(F("\n      -- LEFT ch6: skipped, not present --"));
-  if (rightOk) encoderHealth("RIGHT ch3", MASK_RIGHT); else Serial.println(F("\n      -- RIGHT ch3: skipped, not present --"));
+  Serial.println(F("\n[5] ENCODER HEALTH  (magnet placement read from registers)"));
+  if (leftOk)  encoderHealth("LEFT  ch6", MASK_LEFT);  else Serial.println(F("\n      -- LEFT ch6: absent --"));
+  if (rightOk) encoderHealth("RIGHT ch3", MASK_RIGHT); else Serial.println(F("\n      -- RIGHT ch3: absent --"));
   muxWrite(0x00);
 }
 
-// ---------------------------------------------------------------- test 6
-static void testDrivePins() {
-  Serial.println(F("\n[6] DRIVER PIN CONTINUITY"));
-  Serial.println(F("      SKIPPED BY DESIGN."));
-  Serial.println(F("      R_EN/L_EN are hard-wired to VCC on this harness, so both drivers are"));
-  Serial.println(F("      permanently enabled. The pull-up probe this test used would raise an"));
-  Serial.println(F("      IN pin and actually drive the motor. The only safe proof that the PWM"));
-  Serial.println(F("      wiring is correct is the spin test -- command 'l' or 'k'."));
-  killDrive();
-}
-
-// ---------------------------------------------------------------- summary
-static void summary() {
-  Serial.println(F("\n================ SUMMARY ================"));
-  Serial.printf("  PCA9548A @ 0x70 .......... %s\n", ping(MUX_ADDR) ? "PRESENT" : "MISSING");
-  Serial.printf("  LEFT  AS5600 on ch6 ...... %s\n", leftOk  ? "PRESENT" : "MISSING");
-  Serial.printf("  RIGHT AS5600 on ch3 ...... %s\n", rightOk ? "PRESENT" : "MISSING");
-  Serial.println(F("  BTS7960 signal wiring .... not provable from software, see [6]"));
-  Serial.println(F("\n  COMMANDS (type + Enter):"));
-  Serial.println(F("    a  - live angle stream, both encoders (turn wheels by hand)"));
-  Serial.println(F("    r  - re-run the whole test sequence"));
-  Serial.println(F("    l  - spin LEFT motor  25% duty, 1 s   [WHEELS OFF THE GROUND]"));
-  Serial.println(F("    k  - spin RIGHT motor 25% duty, 1 s   [WHEELS OFF THE GROUND]"));
-  Serial.println(F("    s  - stop everything now"));
-  Serial.println(F("=========================================\n"));
-}
-
-// ---------------------------------------------------------------- motion
-static void spin(const char *name, uint8_t rpwm, uint8_t lpwm, uint8_t mask) {
-  Serial.printf("\n  spinning %s at 25%% for 1 s -- watch the wheel\n", name);
-  int before = -1, after = -1;
-  if (muxWrite(mask)) { delay(2); before = as5600Read12(AS_RAW_ANGLE); }
-
-  digitalWrite(PIN_EN, HIGH);
-  analogWrite(rpwm, 64);          // ~25 % duty
-  digitalWrite(lpwm, LOW);
-  delay(1000);
-  analogWrite(rpwm, 0);
-  digitalWrite(rpwm, LOW);
-  digitalWrite(PIN_EN, LOW);
-  delay(300);                     // let it coast to a stop
-
-  if (muxWrite(mask)) { delay(2); after = as5600Read12(AS_RAW_ANGLE); }
-  Serial.printf("  RAW_ANGLE before %d, after %d", before, after);
-  if (before >= 0 && after >= 0) {
-    int d = after - before;
-    if (abs(d) < 20) Serial.println(F("  -> encoder did NOT move. Motor did not turn, or magnet is not on this shaft."));
-    else             Serial.printf("  -> moved %d counts, encoder and motor agree.\n", d);
-  } else Serial.println();
-  killDrive();
-}
-
-// ---------------------------------------------------------------- telemetry
-// Machine-readable stream for the magnet-tuning GUI. One line per sample:
-//   T,<Lang>,<Lagc>,<Lmag>,<Lstat>,<Rang>,<Ragc>,<Rmag>,<Rstat>
-// A field of -1 means that read failed.
-
-struct EncData { int ang, agc, mag, stat; };
-
-static EncData readAllRegs(uint8_t mask) {
-  EncData d = { -1, -1, -1, -1 };
-  if (!muxWrite(mask)) return d;
-  delayMicroseconds(300);
-  d.stat = as5600Read8(AS_STATUS);
-  if (d.stat < 0) return d;
-  d.agc = as5600Read8(AS_AGC);
-  d.mag = as5600Read12(AS_MAGNITUDE);
-  d.ang = as5600Read12(AS_RAW_ANGLE);
-  return d;
-}
-
-static void telemetrySample() {
-  EncData l = readAllRegs(MASK_LEFT);
-  EncData r = readAllRegs(MASK_RIGHT);
-  Serial.printf("T,%d,%d,%d,%d,%d,%d,%d,%d\n",
-                l.ang, l.agc, l.mag, l.stat,
-                r.ang, r.agc, r.mag, r.stat);
-}
-
 // ---------------------------------------------------------------- mapping
-// Drive one PWM pin at a time and watch BOTH encoders. This is the only way to
-// learn which GPIO actually reaches which driver, independent of the labels.
+static int readEnc(uint8_t mask) {
+  if (!muxWrite(mask)) return -1;
+  delayMicroseconds(400);
+  return as5600Read12(AS_RAW_ANGLE);
+}
 
 static int16_t wrapDelta(int prev, int now) {
   int d = now - prev;
@@ -272,60 +420,47 @@ static int16_t wrapDelta(int prev, int now) {
   return (int16_t)d;
 }
 
-static int readEnc(uint8_t mask) {
-  if (!muxWrite(mask)) return -1;
-  delayMicroseconds(400);
-  return as5600Read12(AS_RAW_ANGLE);
-}
-
-#define MAP_CH   4          // LEDC channel used only for this test
-#define MAP_DUTY 154        // ~60 % of 8-bit -- enough to break stiction
-
-static void mapPin(const char *name, uint8_t pin) {
+static void mapPin(uint8_t idx) {
   int lp = readEnc(MASK_LEFT), rp = readEnc(MASK_RIGHT);
   long lacc = 0, racc = 0;
 
-  ledcSetup(MAP_CH, 15000, 8);
-  ledcAttachPin(pin, MAP_CH);
-  ledcWrite(MAP_CH, MAP_DUTY);
-
+  pwmSet(idx, 154);                       // ~60 %, enough to break stiction
   uint32_t t0 = millis();
   while (millis() - t0 < 1200) {
-    int l = readEnc(MASK_LEFT);
-    int r = readEnc(MASK_RIGHT);
+    int l = readEnc(MASK_LEFT), r = readEnc(MASK_RIGHT);
     if (l >= 0 && lp >= 0) lacc += wrapDelta(lp, l);
     if (r >= 0 && rp >= 0) racc += wrapDelta(rp, r);
     if (l >= 0) lp = l;
     if (r >= 0) rp = r;
   }
-
-  ledcWrite(MAP_CH, 0);
-  ledcDetachPin(pin);
-  pinMode(pin, OUTPUT);
-  digitalWrite(pin, LOW);
-  delay(500);                               // coast, then catch the last motion
+  pwmSet(idx, 0);
+  delay(500);
   int l = readEnc(MASK_LEFT), r = readEnc(MASK_RIGHT);
   if (l >= 0 && lp >= 0) lacc += wrapDelta(lp, l);
   if (r >= 0 && rp >= 0) racc += wrapDelta(rp, r);
 
-  const char *verdict;
   bool lm = labs(lacc) > 40, rm = labs(racc) > 40;
-  if (lm && rm)      verdict = "BOTH encoders moved -- shared wire or chassis vibration";
-  else if (lm)       verdict = "-> drives the LEFT wheel";
-  else if (rm)       verdict = "-> drives the RIGHT wheel";
-  else               verdict = "-> nothing moved";
-  Serial.printf("      %-14s  left %+6ld  right %+6ld   %s\n", name, lacc, racc, verdict);
+  const char *v = (lm && rm) ? "BOTH -- shared wire or vibration"
+                : lm ? "-> drives the LEFT wheel"
+                : rm ? "-> drives the RIGHT wheel" : "-> nothing moved";
+  Serial.printf("      %-12s  left %+6ld  right %+6ld   %s\n", PWM_NAME[idx], lacc, racc, v);
 }
 
 static void mappingTest() {
   Serial.println(F("\n[M] PWM MAPPING  (one pin at a time, both encoders watched)"));
   Serial.println(F("      60% duty, 1.2 s per pin. WHEELS OFF THE GROUND."));
-  mapPin("LEFT  RPWM", PIN_L_RPWM);
-  mapPin("LEFT  LPWM", PIN_L_LPWM);
-  mapPin("RIGHT RPWM", PIN_R_RPWM);
-  mapPin("RIGHT LPWM", PIN_R_LPWM);
+  for (uint8_t i = 0; i < 4; i++) mapPin(i);
   killDrive();
   Serial.println(F("      PASS = each label moves its own wheel, RPWM +ve and LPWM -ve."));
+}
+
+static void summary() {
+  Serial.println(F("\n================ SUMMARY ================"));
+  Serial.printf("  PCA9548A @ 0x70 ....... %s\n", ping(MUX_ADDR) ? "PRESENT" : "MISSING");
+  Serial.printf("  LEFT  AS5600 ch6 ...... %s\n", leftOk  ? "PRESENT" : "MISSING");
+  Serial.printf("  RIGHT AS5600 ch3 ...... %s\n", rightOk ? "PRESENT" : "MISSING");
+  Serial.println(F("  ready -- see README for the command set"));
+  Serial.println(F("=========================================\n"));
 }
 
 static void runAll() {
@@ -334,56 +469,144 @@ static void runAll() {
   testResetPin();
   scanAllChannels();
   testEncoders();
-  testDrivePins();
   summary();
 }
 
+// ---------------------------------------------------------------- telemetry
+static void sendTelem() {
+  Serial.printf("D,%lld,%lld,%.0f,%d,%lu,%lld,%lld,%.0f,%d,%lu,%d,%d\n",
+                (long long)WL.pos, (long long)WL.target, WL.vel, WL.duty, WL.errCount,
+                (long long)WR.pos, (long long)WR.target, WR.vel, WR.duty, WR.errCount,
+                WL.mode, WR.mode);
+}
+
+static void sendStatus() {
+  int la = -1, lst = -1, ra = -1, rst = -1;
+  if (muxWrite(MASK_LEFT))  { delayMicroseconds(300); lst = as5600Read8(AS_STATUS); la = as5600Read8(AS_AGC); }
+  if (muxWrite(MASK_RIGHT)) { delayMicroseconds(300); rst = as5600Read8(AS_STATUS); ra = as5600Read8(AS_AGC); }
+  Serial.printf("S,%d,%d,%d,%d,%.3f,%.3f,%.4f,%d,%d,%d,%d,%d,%.2f,%.2f\n",
+                la, lst, ra, rst, Kp, Ki, Kd, POS_TOL,
+                WL.minDutyFwd, WL.minDutyRev, WR.minDutyFwd, WR.minDutyRev,
+                WL.slope, WR.slope);
+}
+
+// ---------------------------------------------------------------- commands
+static Wheel *pickWheel(const String &s) {
+  if (s == "L" || s == "l") return &WL;
+  if (s == "R" || s == "r") return &WR;
+  return nullptr;
+}
+
+static void moveBy(Wheel &w, float degrees) {
+  w.target = w.pos + (int64_t)lroundf(degrees * CPR / 360.0f);
+  w.integ = 0;
+  w.prevErr = 0;
+  w.settled = false;
+  w.settleStart = 0;
+  w.mode = 2;
+  Serial.printf("ACK,move,%s,%.2f\n", w.name, degrees);
+}
+
+static void handleLine(String line) {
+  line.trim();
+  if (!line.length()) return;
+
+  // legacy single-key diagnostics
+  if (line.length() == 1) {
+    char c = line[0];
+    if (c == 't') { telem = !telem; return; }
+    if (c == 'r') { stopAll(); runAll(); return; }
+    if (c == 'm') { stopAll(); mappingTest(); return; }
+    if (c == 'x' || c == 's') { stopAll(); Serial.println(F("ACK,stop")); return; }
+    if (c >= '1' && c <= '4') { stopAll(); mapPin(c - '1'); return; }
+  }
+
+  String tok[5];
+  int n = 0, i = 0;
+  while (n < 5 && i < (int)line.length()) {
+    int sp = line.indexOf(' ', i);
+    if (sp < 0) sp = line.length();
+    tok[n++] = line.substring(i, sp);
+    i = sp + 1;
+  }
+  String cmd = tok[0];
+  cmd.toUpperCase();
+
+  if (cmd == "P" && n >= 3) {                 // P <L|R> <degrees>  relative move
+    Wheel *w = pickWheel(tok[1]);
+    if (w) moveBy(*w, tok[2].toFloat());
+  } else if (cmd == "PB" && n >= 2) {         // PB <degrees>  both wheels
+    float d = tok[1].toFloat();
+    moveBy(WL, d);
+    moveBy(WR, d);
+  } else if (cmd == "D" && n >= 3) {          // D <L|R> <-255..255>  open loop
+    Wheel *w = pickWheel(tok[1]);
+    if (w) { w->mode = 1; applyDuty(*w, tok[2].toInt()); Serial.printf("ACK,duty,%s,%d\n", w->name, w->duty); }
+  } else if (cmd == "V" && n >= 3) {          // V <L|R> <counts/s>
+    Wheel *w = pickWheel(tok[1]);
+    if (w) { w->mode = 3; w->integ = 0; w->velTarget = tok[2].toFloat(); Serial.printf("ACK,vel,%s,%.0f\n", w->name, w->velTarget); }
+  } else if (cmd == "C" && n >= 2) {          // C <L|R>  calibrate
+    Wheel *w = pickWheel(tok[1]);
+    if (w) calibrate(*w);
+  } else if (cmd == "K" && n >= 4) {          // K <kp> <ki> <kd>
+    Kp = tok[1].toFloat(); Ki = tok[2].toFloat(); Kd = tok[3].toFloat();
+    Serial.printf("ACK,gains,%.3f,%.3f,%.4f\n", Kp, Ki, Kd);
+  } else if (cmd == "TOL" && n >= 2) {
+    POS_TOL = tok[1].toInt();
+    Serial.printf("ACK,tol,%d\n", POS_TOL);
+  } else if (cmd == "Z") {                    // zero both positions
+    WL.pos = WL.target = 0; WR.pos = WR.target = 0;
+    Serial.println(F("ACK,zero"));
+  } else if (cmd == "X") {
+    stopAll();
+    Serial.println(F("ACK,stop"));
+  } else if (cmd == "T") {
+    telem = !telem;
+  } else {
+    Serial.printf("ERR,unknown,%s\n", line.c_str());
+  }
+}
+
+// ---------------------------------------------------------------- main
 void setup() {
-  killDrive();                    // first, before anything else
+  for (uint8_t i = 0; i < 4; i++) { pinMode(PWM_PIN[i], OUTPUT); digitalWrite(PWM_PIN[i], LOW); }
   pinMode(PIN_MUX_RESET, OUTPUT);
   digitalWrite(PIN_MUX_RESET, HIGH);
+  pwmInit();
+  killDrive();
 
   Serial.begin(115200);
   delay(400);
   Wire.begin(PIN_SDA, PIN_SCL, 400000);
 
-  Serial.println(F("\n\n########## DRIVE HARNESS DIAGNOSTIC ##########"));
-  Serial.println(F("Motor rail is live and EN is strapped to VCC -- the drivers are ALWAYS"));
-  Serial.println(F("enabled. Only RPWM/LPWM being low keeps the motors still."));
+  Serial.println(F("\n\n########## DRIVE HARNESS ##########"));
+  Serial.println(F("Motor rail live, EN strapped to VCC -- drivers always enabled."));
   runAll();
 }
 
-static bool streaming = false;
-static bool telem = false;
-
 void loop() {
-  if (Serial.available()) {
+  static String buf;
+  static uint32_t lastLoop = 0, lastTelem = 0, lastStat = 0;
+
+  while (Serial.available()) {
     char c = Serial.read();
-    if (c == 't') { telem = !telem; }
-    else if (c == 'a') { streaming = !streaming; Serial.println(streaming ? F("\nstreaming on") : F("\nstreaming off")); }
-    else if (c == 'r') { streaming = false; runAll(); }
-    else if (c == 'l') { streaming = false; spin("LEFT",  PIN_L_RPWM, PIN_L_LPWM, MASK_LEFT); }
-    else if (c == 'k') { streaming = false; spin("RIGHT", PIN_R_RPWM, PIN_R_LPWM, MASK_RIGHT); }
-    else if (c == 's') { streaming = false; killDrive(); Serial.println(F("\nstopped")); }
-    else if (c == 'm') { streaming = false; mappingTest(); }
-    else if (c == '1') { streaming = false; Serial.println(F("\nGPIO25 L_RPWM:")); mapPin("GPIO25 L_RPWM", PIN_L_RPWM); }
-    else if (c == '2') { streaming = false; Serial.println(F("\nGPIO26 L_LPWM:")); mapPin("GPIO26 L_LPWM", PIN_L_LPWM); }
-    else if (c == '3') { streaming = false; Serial.println(F("\nGPIO32 R_RPWM:")); mapPin("GPIO32 R_RPWM", PIN_R_RPWM); }
-    else if (c == '4') { streaming = false; Serial.println(F("\nGPIO33 R_LPWM:")); mapPin("GPIO33 R_LPWM", PIN_R_LPWM); }
+    if (c == '\n' || c == '\r') { handleLine(buf); buf = ""; }
+    else if (buf.length() < 60) buf += c;
   }
 
-  if (telem) {
-    telemetrySample();
-    delay(40);                    // ~20 Hz, fast enough to feel live in the hand
-    return;
+  uint32_t now = micros();
+  if (now - lastLoop >= LOOP_US) {
+    float dt = (now - lastLoop) / 1e6f;
+    if (dt > 0.2f) dt = LOOP_US / 1e6f;       // first pass or after a blocking call
+    lastLoop = now;
+
+    updateWheel(WL, dt);
+    updateWheel(WR, dt);
+    controlWheel(WL, dt);
+    controlWheel(WR, dt);
   }
 
-  if (streaming) {
-    int l = -1, r = -1;
-    if (muxWrite(MASK_LEFT))  { delay(1); l = as5600Read12(AS_RAW_ANGLE); }
-    if (muxWrite(MASK_RIGHT)) { delay(1); r = as5600Read12(AS_RAW_ANGLE); }
-    Serial.printf("  LEFT %5d (%6.1f deg)   RIGHT %5d (%6.1f deg)\n",
-                  l, l * 360.0 / 4096.0, r, r * 360.0 / 4096.0);
-    delay(150);
-  }
+  uint32_t ms = millis();
+  if (telem && ms - lastTelem >= 50)  { lastTelem = ms; sendTelem(); }
+  if (telem && ms - lastStat  >= 700) { lastStat  = ms; sendStatus(); }
 }

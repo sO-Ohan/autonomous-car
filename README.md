@@ -63,17 +63,31 @@ PlatformIO, `board = esp32dev`, Arduino framework.
 pio run -t upload
 ```
 
-On boot it runs the full check sequence and then waits at a serial prompt.
+On boot it runs the full check sequence, then accepts line commands and runs a
+200 Hz control loop.
 
-| Key | Action |
+| Command | Action |
 |---|---|
-| `r` | re-run the whole check sequence |
-| `m` | PWM mapping — drives each pin alone, watches both encoders |
-| `1`–`4` | map a single pin (L_RPWM, L_LPWM, R_RPWM, R_LPWM) |
-| `a` | live angle stream, both encoders |
-| `t` | machine-readable telemetry for the tuning GUI |
-| `l` / `k` | spin left / right motor, 25% for 1 s |
-| `s` | stop everything |
+| `P <L\|R> <deg>` | closed-loop relative rotation |
+| `PB <deg>` | same move on both wheels |
+| `D <L\|R> <-255..255>` | open-loop duty |
+| `V <L\|R> <counts/s>` | velocity control |
+| `C <L\|R>` | calibrate — measures deadband and duty→speed slope |
+| `K <kp> <ki> <kd>` | set PID gains live |
+| `TOL <counts>` | set settling tolerance |
+| `Z` / `X` / `T` | zero position / stop / toggle telemetry |
+| `r` `m` `1`–`4` | diagnostics: full scan, PWM mapping, single-pin map |
+
+`X` also aborts a running calibration, which is why calibration polls the
+serial port itself rather than blocking the loop outright.
+
+### Control design
+
+Position is tracked by unwrapping the AS5600's 12-bit angle into an `int64_t`,
+so travel is unbounded across revolutions. The PID adds a **stiction kick**:
+below the measured deadband a BTS7960-driven motor produces no torque at all,
+so a small proportional term would just sit there humming. Any output below
+the calibrated deadband is raised to it.
 
 ### What the check sequence proves
 
@@ -111,6 +125,30 @@ directions. Shows an AGC arc gauge with the good band drawn into the scale, a
 best-so-far marker, a 20 s history strip, MD/ML/MH status LEDs, and a shaft
 dial with a turn counter.
 
+### `drive_tui.py` — control console
+
+```sh
+python3 drive_tui.py [/dev/ttyUSB0]
+```
+
+Live position, target, error, velocity, duty and magnet health for both
+wheels, plus calibration results and a rolling record of the settling error of
+every move — so a gain change can be judged against measured error instead of
+by feel.
+
+| Key | Action |
+|---|---|
+| `tab` | select wheel |
+| `h` / `l` | rotate −15° / +15° |
+| `j` / `k` | rotate −90° / +90° |
+| `J` / `K` | rotate −360° / +360° |
+| `w` / `s` | duty +10 / −10 |
+| `space` | stop |
+| `z` | zero position |
+| `c` | calibrate selected wheel |
+| `:` | command line (`p 123.5`, `v 4000`, `k 0.35 0.4 0.004`, `tol 2`) |
+| `q` | quit |
+
 ### Other scripts
 
 | Script | Purpose |
@@ -118,18 +156,50 @@ dial with a turn counter.
 | `capture.py <port> <secs>` | reset the board and capture serial output |
 | `run_cmd.py <port> <cmd> <secs>` | reset, wait for boot, send a command, capture |
 | `spin.py <port>` | reset, then spin each motor once |
+| `selftest_control.py <port>` | headless check of moves and calibration |
 
 Only one program can hold the serial port at a time.
 
+## Measured results
+
+Encoders, after tuning the air gap with `encoder_tune.py`:
+
+| | AGC | ML flag | MAGNITUDE |
+|---|---|---|---|
+| LEFT | 70 | clear | 2129 |
+| RIGHT | 45 | clear | 2124 |
+
+Motor calibration:
+
+| | Deadband fwd / rev | Slope | Top speed |
+|---|---|---|---|
+| LEFT | 34 / 32 | 70.7 cts/s per duty | 16089 cts/s (236 rpm) |
+| RIGHT | 36 / 34 | 68.8 cts/s per duty | 15336 cts/s (225 rpm) |
+
+Left runs about 5% faster than right at identical duty. The per-wheel
+feedforward compensates for it; without that a straight-line command curves.
+
+Settling error over 6 moves per setting:
+
+| Setting | mean \|err\| | worst |
+|---|---|---|
+| tol 8 | 0.468° | 0.700° |
+| tol 4 | 0.307° | 0.350° |
+| **tol 2** (default) | **0.120°** | **0.180°** |
+
+Raising Kp did not help — at Kp 0.55 the wheel hunted and failed to settle on
+3 of 6 moves. Tolerance, not gain, was the limiting factor. One count is
+0.088°, so tol 2 sits just above the encoder's quantisation floor.
+
 ## Status
 
-Verified working: I²C switch and isolation, both encoders present and
-counting, and the full command → driver → motor → magnet → encoder loop on
-both sides with under 1 count of cross-talk.
+Verified on hardware: I²C switch and channel isolation, both encoders present
+and counting, the full command → driver → motor → magnet → encoder loop on
+both sides with under 1 count of cross-talk, closed-loop moves settling inside
+0.18°, and calibration measuring deadband and speed slope on both wheels.
 
-Outstanding: both magnets read AGC 128 with ML set — air gap too large, no
-gain headroom. They count cleanly at bench speed, but that is the condition
-`encoder_tune.py` exists to fix.
+Not yet done: counts-per-metre calibration against a measured straight run,
+which needs a tape measure and cannot be derived on the bench.
 
 ## Licence
 
