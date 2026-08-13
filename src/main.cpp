@@ -248,6 +248,12 @@ static float VEL_LIMIT = 18000.0f; // counts/s, above the measured 16089 top spe
 static float CPM = 10905.0f;       // counts per metre
 static float TRACK_MM = 0.0f;      // wheel centre-to-centre, MUST be measured
 
+// Encoder sign that corresponds to the robot moving FORWARD, per wheel. The
+// two motors are mounted mirrored, so the right encoder counts down as the
+// robot goes forward. Without this, "both wheels positive" is a turn, not a
+// straight line -- which is exactly how it behaved. Flip with WDIR <L|R> <1|-1>.
+static int DIR_L = 1, DIR_R = -1;
+
 // Pose, integrated from both encoders. Standard differential-drive odometry.
 static double poseX = 0, poseY = 0, poseTh = 0;
 static int64_t lastPoseL = 0, lastPoseR = 0;
@@ -807,8 +813,8 @@ static void moveBy(Wheel &w, float degrees) {
 static void driveMetres(float m) {
   lastDriveM = m;
   int64_t c = (int64_t)lroundf(m * CPM);
-  moveCounts(WL, c);
-  moveCounts(WR, c);
+  moveCounts(WL, c * DIR_L);
+  moveCounts(WR, c * DIR_R);
   Out.printf("ACK,drive,%.4f,%lld\n", m, (long long)c);
 }
 
@@ -822,16 +828,16 @@ static bool turnDegrees(float deg) {
   }
   float arc = (TRACK_MM / 2000.0f) * deg * (float)M_PI / 180.0f;   // metres
   int64_t c = (int64_t)lroundf(arc * CPM);
-  moveCounts(WL, -c);
-  moveCounts(WR, +c);
+  moveCounts(WL, -c * DIR_L);        // left wheel back, right wheel forward
+  moveCounts(WR, +c * DIR_R);
   Out.printf("ACK,turn,%.2f,%lld\n", deg, (long long)c);
   return true;
 }
 
 static void updatePose() {
   if (TRACK_MM <= 0) { lastPoseL = WL.pos; lastPoseR = WR.pos; return; }
-  double dl = (WL.pos - lastPoseL) / (double)CPM;
-  double dr = (WR.pos - lastPoseR) / (double)CPM;
+  double dl = (WL.pos - lastPoseL) * DIR_L / (double)CPM;
+  double dr = (WR.pos - lastPoseR) * DIR_R / (double)CPM;
   lastPoseL = WL.pos;
   lastPoseR = WR.pos;
   if (dl == 0 && dr == 0) return;
@@ -1038,8 +1044,8 @@ static void handleLine(String line) {
     // is not yet known.
     float d = tok[1].toFloat();
     int64_t c = (int64_t)lroundf(d * CPR / 360.0f);
-    moveCounts(WL, -c);
-    moveCounts(WR, +c);
+    moveCounts(WL, -c * DIR_L);      // same geometry as TURN, wheel units
+    moveCounts(WR, +c * DIR_R);
     Out.printf("ACK,spin,%.2f\n", d);
   } else if (cmd == "POSE") {
     Out.printf("POSE,%.4f,%.4f,%.2f,%.4f,%.4f\n", poseX, poseY,
@@ -1105,8 +1111,16 @@ static void handleLine(String line) {
     Out.println(F("ACK,reboot"));
     delay(120);
     ESP.restart();
+  } else if (cmd == "WDIR" && n >= 3) {       // WDIR <L|R> <1|-1>
+    int v = (tok[2].toInt() >= 0) ? 1 : -1;
+    if (tok[1] == "L" || tok[1] == "l") DIR_L = v; else DIR_R = v;
+    prefs.begin("drive", false);
+    prefs.putInt("dirL", DIR_L);
+    prefs.putInt("dirR", DIR_R);
+    prefs.end();
+    Out.printf("ACK,wdir,%d,%d\n", DIR_L, DIR_R);
   } else if (cmd == "GEOM") {
-    Out.printf("GEOM,%.1f,%.1f,%.4f\n", CPM, TRACK_MM, lastDriveM);
+    Out.printf("GEOM,%.1f,%.1f,%.4f,%d,%d\n", CPM, TRACK_MM, lastDriveM, DIR_L, DIR_R);
   } else if (cmd == "CALQ") {                 // report calibration state on demand
     Out.printf("CALLOAD,L,%d,%d,%d,%.2f\n",
                   (WL.minDutyFwd > 0 && WL.minDutyRev > 0) ? 1 : 0,
@@ -1152,7 +1166,10 @@ void setup() {
   prefs.begin("drive", true);
   CPM = prefs.getFloat("cpm", CPM);
   TRACK_MM = prefs.getFloat("track", 0.0f);
+  DIR_L = prefs.getInt("dirL", DIR_L);
+  DIR_R = prefs.getInt("dirR", DIR_R);
   prefs.end();
+  Out.printf("WDIR,%d,%d\n", DIR_L, DIR_R);
   Out.printf("GEOM,%.1f,%.1f,0.0\n", CPM, TRACK_MM);
   if (TRACK_MM <= 0)
     Out.println(F("WARNING: TRACK not set -- TURN and pose are unavailable. Use: TRACK <mm>"));
