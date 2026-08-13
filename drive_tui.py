@@ -32,12 +32,19 @@ from rich.align import Align
 
 CPR = 4096.0
 
-HELP = [
-    ("w / s", "forward / back"), ("a / d", "left / right"),
-    ("↑↓←→", "same"), ("+ -", "step ±5 cm"), ("[ ]", "turn step ±5°"),
+HELP_DRIVE = [
+    ("0-9", "distance in cm"), ("w / s", "go fwd / back"),
+    ("a / d", "turn left / right"), ("enter", "go forward"),
+    ("+ -", "speed ±5 cm/s"), ("[ ]", "turn step ±5°"),
     ("i / o", "flip drive / steer"), ("space", "STOP"),
-    ("tab", "wheel"), ("j / k", "wheel ∓90°"), ("z", "zero"),
-    ("c", "calibrate"), (":", "command"), ("q", "quit"),
+    ("m", "advanced"), (":", "command"), ("q", "quit"),
+]
+
+HELP_ADV = [
+    ("tab", "select wheel"), ("j / k", "wheel ∓90°"), ("J / K", "wheel ∓360°"),
+    ("h / l", "wheel ∓15°"), ("c", "calibrate"), ("z", "zero"),
+    ("w a s d", "drive"), ("space", "STOP"),
+    ("m", "drive mode"), (":", "command"), ("q", "quit"),
 ]
 
 
@@ -150,6 +157,9 @@ class Link(threading.Thread):
                     "Rdf": int(p[11]), "Rdr": int(p[12]),
                     "Lslope": float(p[13]), "Rslope": float(p[14]),
                 }
+                if len(p) >= 19:      # newer firmware also reports limits
+                    self.s.update({"vmax": float(p[15]), "amax": float(p[16])})
+                    self.geom = {"cpm": float(p[17]), "track": float(p[18])}
             except ValueError:
                 pass
 
@@ -228,6 +238,9 @@ class App:
         self.step_deg = 15.0        # degrees per arrow press
         self.inv_drive = 1          # flip with 'i' if w/s are backwards
         self.inv_steer = 1          # flip with 'o' if a/d are backwards
+        self.mode = "drive"         # "drive" (simple) or "advanced" (full)
+        self.numbuf = ""            # typed distance/angle, consumed by w/s/a/d
+        self.speed_cms = 27.5       # matches the firmware VMAX 3000 default
 
     # ------------------------------------------------------------- rendering
     def wheel_panel(self, w):
@@ -291,6 +304,50 @@ class App:
         title = f"[bold]{'▸ ' if w == self.sel else ''}{w}[/]"
         return Panel(t, title=title, border_style=border)
 
+    def drive_panel(self):
+        """Simple mode: odometry, speed, and a typed distance."""
+        d = self.link.d
+        cpm = self.link.geom.get("cpm", 10905.0)
+        track = self.link.geom.get("track", 0)
+
+        t = Table.grid(padding=(0, 2))
+        t.add_column(justify="right", style="grey58", min_width=10)
+        t.add_column(justify="left", min_width=44)
+
+        if d:
+            lm = d["L"]["pos"] / cpm
+            rm = d["R"]["pos"] / cpm
+            dist = (lm + rm) / 2
+            moving = d["L"]["mode"] != 0 or d["R"]["mode"] != 0
+            t.add_row("travelled", Text(f"{dist*100:+9.1f} cm      ({dist:+.3f} m)",
+                                        style="bright_white"))
+            t.add_row("wheels", Text(f"L {lm*100:+8.1f} cm     R {rm*100:+8.1f} cm",
+                                     style="grey70"))
+            vel = (d["L"]["vel"] + d["R"]["vel"]) / 2 / cpm * 100
+            t.add_row("now", Text(f"{vel:+7.1f} cm/s",
+                                  style="cyan" if moving else "grey58"))
+            t.add_row("state", Text("MOVING" if moving else "idle",
+                                    style="yellow bold" if moving else "green"))
+        else:
+            t.add_row("", Text("waiting for telemetry", style="grey42"))
+
+        width = 24
+        filled = int(round(self.speed_cms / 140.0 * width))
+        bar_txt = "█" * filled + "·" * (width - filled)
+        t.add_row("speed", Text(f"{self.speed_cms:5.1f} cm/s  [{bar_txt}]  + / -",
+                                style="magenta"))
+
+        turn_unit = "° heading" if track > 0 else "° wheel (TRACK unset)"
+        t.add_row("turn step", Text(f"{self.step_deg:.0f}{turn_unit}", style="grey70"))
+
+        entry = self.numbuf if self.numbuf else ""
+        t.add_row("", "")
+        t.add_row("distance",
+                  Text(f"{entry or '—'}▌  cm     type a number, then w / s"
+                       f"   (a / d turns by it)",
+                       style="bright_white" if entry else "grey42"))
+        return Panel(t, title="[bold]DRIVE[/]", border_style="cyan")
+
     def cal_panel(self):
         t = Table.grid(padding=(0, 2))
         t.add_column(style="grey58", min_width=8)
@@ -348,28 +405,44 @@ class App:
         gains = (f"Kp {s.get('kp', 0):.3f}   Ki {s.get('ki', 0):.3f}   "
                  f"Kd {s.get('kd', 0):.4f}   tol {s.get('tol', 0)} cts") if s else "gains —"
         gains = drive + "      " + gains
-        keys = "   ".join(f"[bold cyan]{k}[/] {v}" for k, v in HELP)
+        keys = "   ".join(f"[bold cyan]{k}[/] {v}" for k, v in
+                          (HELP_DRIVE if self.mode == "drive" else HELP_ADV))
         return Panel(Group(Text.from_markup(f"[grey58]{gains}[/]"), Text.from_markup(keys)),
                      border_style="grey35")
 
+    def head_panel(self):
+        conn = ("[green]connected[/]" if self.link.connected else "[yellow]connecting…[/]")
+        mode = ("[bold cyan]DRIVE[/]" if self.mode == "drive"
+                else "[bold magenta]ADVANCED[/]")
+        return Panel(Align.center(Text.from_markup(
+            f"[bold]SLAM_bot[/]   {self.port}   {conn}   {mode} mode "
+            f"[grey58](m to switch)   {self.link.rate:4.1f} Hz[/]")),
+            border_style="grey35")
+
     def render(self):
         lay = Layout()
-        lay.split_column(
-            Layout(name="head", size=3),
-            Layout(name="wheels", size=16),
-            Layout(name="cal", size=6),
-            Layout(name="log", size=10),
-            Layout(name="foot", size=5),
-        )
-        conn = ("[green]connected[/]" if self.link.connected else "[yellow]connecting…[/]")
-        lay["head"].update(Panel(Align.center(Text.from_markup(
-            f"[bold]DRIVE HARNESS[/]   {self.port}   {conn}   "
-            f"[grey58]{self.link.rate:4.1f} Hz   selected [bold cyan]{self.sel}[/][/]")),
-            border_style="grey35"))
-        w = Layout()
-        w.split_row(Layout(self.wheel_panel("L")), Layout(self.wheel_panel("R")))
-        lay["wheels"].update(w)
-        lay["cal"].update(self.cal_panel())
+        if self.mode == "drive":
+            lay.split_column(
+                Layout(name="head", size=3),
+                Layout(name="drive", size=14),
+                Layout(name="log", size=9),
+                Layout(name="foot", size=5),
+            )
+            lay["drive"].update(self.drive_panel())
+        else:
+            lay.split_column(
+                Layout(name="head", size=3),
+                Layout(name="wheels", size=16),
+                Layout(name="cal", size=6),
+                Layout(name="log", size=8),
+                Layout(name="foot", size=5),
+            )
+            w = Layout()
+            w.split_row(Layout(self.wheel_panel("L")), Layout(self.wheel_panel("R")))
+            lay["wheels"].update(w)
+            lay["cal"].update(self.cal_panel())
+
+        lay["head"].update(self.head_panel())
         lay["log"].update(self.log_panel())
         lay["foot"].update(self.footer())
         return lay
@@ -379,11 +452,38 @@ class App:
     # inv_drive / inv_steer let the operator correct the convention live, since
     # which way is "forward" depends on how the motors and wheels are mounted
     # and cannot be known from the firmware side.
+    def take_number(self):
+        """Consume a typed number, or fall back to the default step."""
+        if not self.numbuf:
+            return None
+        try:
+            v = float(self.numbuf)
+        except ValueError:
+            v = None
+        self.numbuf = ""
+        return v
+
+    def set_speed(self, cms):
+        """Speed in cm/s, pushed to the firmware as profile limits."""
+        self.speed_cms = max(2.0, min(140.0, cms))
+        cpm = self.link.geom.get("cpm", 10905.0)
+        vmax = self.speed_cms / 100.0 * cpm
+        self.link.send(f"PROF {vmax:.0f} {vmax * 3:.0f}")
+
     def forward(self, sign):
-        self.link.send(f"DRIVE {sign * self.inv_drive * self.step_m:.3f}")
+        cm = self.take_number()
+        metres = (cm / 100.0) if cm is not None else self.step_m
+        self.link.send(f"DRIVE {sign * self.inv_drive * metres:.4f}")
 
     def steer(self, sign):
         sign *= self.inv_steer
+        deg = self.take_number()
+        if deg is not None:
+            if self.link.geom.get("track", 0) > 0:
+                self.link.send(f"TURN {sign * deg:.1f}")
+            else:
+                self.link.send(f"SPIN {sign * deg:.1f}")
+            return
         """
         Left/right. With TRACK measured this is a real heading change; without
         it, fall back to SPIN, which counter-rotates the wheels by a known
@@ -451,18 +551,26 @@ class App:
             self.forward(+1)
         elif ch in ("s", "b"):
             self.forward(-1)
-        elif ch in ("a", ","):
+        elif ch == "a":
             self.steer(+1)
-        elif ch in ("d", "."):
+        elif ch == "d":
             self.steer(-1)
         elif ch == "i":
             self.inv_drive *= -1
         elif ch == "o":
             self.inv_steer *= -1
+        elif ch == "m":
+            self.mode = "advanced" if self.mode == "drive" else "drive"
+        elif ch.isdigit() or (ch == "." and self.numbuf):
+            self.numbuf += ch
+        elif ch in ("\x7f", "\b"):
+            self.numbuf = self.numbuf[:-1]
+        elif ch in ("\r", "\n"):
+            self.forward(+1)          # Enter drives the typed distance
         elif ch == "+" or ch == "=":
-            self.step_m = min(2.0, self.step_m + 0.05)
+            self.set_speed(self.speed_cms + 5)
         elif ch == "-":
-            self.step_m = max(0.05, self.step_m - 0.05)
+            self.set_speed(self.speed_cms - 5)
         elif ch == "]":
             self.step_deg = min(180.0, self.step_deg + 5)
         elif ch == "[":

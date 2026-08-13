@@ -759,10 +759,10 @@ static void sendStatus() {
   int la = -1, lst = -1, ra = -1, rst = -1;
   if (muxWrite(MASK_LEFT))  { delayMicroseconds(300); lst = as5600Read8(AS_STATUS); la = as5600Read8(AS_AGC); }
   if (muxWrite(MASK_RIGHT)) { delayMicroseconds(300); rst = as5600Read8(AS_STATUS); ra = as5600Read8(AS_AGC); }
-  Out.printf("S,%d,%d,%d,%d,%.3f,%.3f,%.4f,%d,%d,%d,%d,%d,%.2f,%.2f\n",
+  Out.printf("S,%d,%d,%d,%d,%.3f,%.3f,%.4f,%d,%d,%d,%d,%d,%.2f,%.2f,%.0f,%.0f,%.1f,%.1f\n",
                 la, lst, ra, rst, Kp, Ki, Kd, POS_TOL,
                 WL.minDutyFwd, WL.minDutyRev, WR.minDutyFwd, WR.minDutyRev,
-                WL.slope, WR.slope);
+                WL.slope, WR.slope, VMAX, AMAX, CPM, TRACK_MM);
 }
 
 // ---------------------------------------------------------------- commands
