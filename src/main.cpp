@@ -830,6 +830,20 @@ static void handleLine(String line) {
       Serial.println();
     }
     Serial.println(F("TRCEND"));
+  } else if (cmd == "CALQ") {                 // report calibration state on demand
+    Serial.printf("CALLOAD,L,%d,%d,%d,%.2f\n",
+                  (WL.minDutyFwd > 0 && WL.minDutyRev > 0) ? 1 : 0,
+                  WL.minDutyFwd, WL.minDutyRev, WL.slope);
+    Serial.printf("CALLOAD,R,%d,%d,%d,%.2f\n",
+                  (WR.minDutyFwd > 0 && WR.minDutyRev > 0) ? 1 : 0,
+                  WR.minDutyFwd, WR.minDutyRev, WR.slope);
+  } else if (cmd == "CALCLR") {               // forget stored calibration
+    prefs.begin("drive", false);
+    prefs.clear();
+    prefs.end();
+    WL.minDutyFwd = WL.minDutyRev = WR.minDutyFwd = WR.minDutyRev = 0;
+    WL.slope = WR.slope = 0;
+    Serial.println(F("ACK,calclr"));
   } else if (cmd == "Z") {                    // zero both positions
     WL.pos = WL.target = 0; WR.pos = WR.target = 0;
     Serial.println(F("ACK,zero"));

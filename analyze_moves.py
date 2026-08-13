@@ -97,11 +97,17 @@ def analyse(target, vals):
 
 
 # Calibration is required: without it the deadband is zero, the stiction kick
-# is disabled, and every move undershoots. Stored values load at boot, so this
-# only actually runs the routine when the board has never been calibrated.
+# is disabled, and every move undershoots. Ask the firmware directly rather
+# than watching for the boot banner -- the banner is printed before this script
+# finishes waiting out the boot, so it gets flushed away with the input buffer.
 lines = []
-pump(0.4, collect="CALLOAD", out=lines)
-if not any(l.split(",")[2] == "1" for l in lines if len(l.split(",")) > 2):
+cmd("CALQ")
+pump(1.0, collect="CALLOAD", out=lines)
+have = {l.split(",")[1]: l.split(",")[2] == "1" for l in lines if len(l.split(",")) > 3}
+if have and all(have.values()):
+    print("using stored calibration: " + "  ".join(
+        l for l in lines if l.startswith("CALLOAD")))
+else:
     print("no stored calibration, running it now...")
     for w in ("L", "R"):
         cmd(f"C {w}")
