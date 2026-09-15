@@ -16,3 +16,8 @@ logs/
 # OS
 *.swp
 .DS_Store
+
+# editor/manual backups (older ones carry wifi credentials)
+*.bak
+*.bak-*
+c3-webgui/src/secrets.h

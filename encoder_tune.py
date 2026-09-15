@@ -96,18 +96,27 @@ class Reader(QThread):
             self.status.emit(f"cannot open {self.port}: {e}")
             return
 
-        # hardware reset, wait out the boot diagnostic, then ask for telemetry
-        self.status.emit("resetting board...")
-        s.setDTR(False)
-        s.setRTS(True)
-        time.sleep(0.15)
-        s.setRTS(False)
-        time.sleep(0.05)
-        s.reset_input_buffer()
-        time.sleep(5.0)
-        s.reset_input_buffer()
-        s.write(b"t\n")
-        self.status.emit(f"streaming from {self.port}")
+        # An ESP32-C3 talks over its own USB peripheral, so pulsing DTR/RTS
+        # resets the chip and tears the USB device down underneath us -- the
+        # handle goes ENODEV and never comes back. That firmware also streams
+        # telemetry unprompted, so skip the reset and the toggle entirely.
+        self.native_usb = "ACM" in self.port
+        if self.native_usb:
+            s.reset_input_buffer()
+            self.status.emit(f"streaming from {self.port}")
+        else:
+            # hardware reset, wait out the boot diagnostic, then ask for telemetry
+            self.status.emit("resetting board...")
+            s.setDTR(False)
+            s.setRTS(True)
+            time.sleep(0.15)
+            s.setRTS(False)
+            time.sleep(0.05)
+            s.reset_input_buffer()
+            time.sleep(5.0)
+            s.reset_input_buffer()
+            s.write(b"t\n")
+            self.status.emit(f"streaming from {self.port}")
 
         buf = b""
         while self.running:
@@ -137,7 +146,8 @@ class Reader(QThread):
                     "R": {"ang": v[4], "agc": v[5], "mag": v[6], "stat": v[7]},
                 })
         try:
-            s.write(b"t\n")
+            if not getattr(self, "native_usb", False):
+                s.write(b"t\n")
             s.close()
         except Exception:
             pass

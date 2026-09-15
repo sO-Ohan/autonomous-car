@@ -8,6 +8,23 @@ switch.
 Both encoders answer to the same address (0x36), which is the reason the
 I²C switch exists — only one channel is ever enabled at a time.
 
+## Current generation: ESP32-C3
+
+The car has moved to an ESP32-C3 Super Mini with a W5500 Ethernet link,
+reached over a Bullet M2 radio. This README still describes the original
+ESP32-WROOM harness (`src/`, `drive_tui.py`, …). The current state is in:
+
+| Doc | Covers |
+|---|---|
+| [`SETUP.md`](SETUP.md) | hardware, as-built wiring, firmware protocol |
+| [`SOFTWARE.md`](SOFTWARE.md) | the `carbot` Python package, odometry node, tools |
+| [`ETHERNET.md`](ETHERNET.md) | console and OTA firmware updates over the W5500 |
+| [`NETWORK.md`](NETWORK.md) | Bullet M2 radio link, robot PC, ROS 2 viewing via Foxglove |
+
+Firmware: `c3-webgui/` (copy `src/secrets.example.h` to `src/secrets.h`
+before building). `c3-ap-test/`, `c3-spin-test/` and `c3-wifi-test/` are
+bring-up sketches.
+
 ## Hardware
 
 | Part | Qty | Notes |
