@@ -1,0 +1,54 @@
+{
+  "wheel_diameter_m": 0.12,
+  "wheel_circumference_m": 0.376991,
+  "counts_per_motor_rev": 4096,
+  "generated": "2026-08-23 21:50:30",
+  "source": "wheel_cal.csv",
+  "wheels": {
+    "LEFT": {
+      "readings": 16,
+      "counts_per_wheel_rev": 75875.2,
+      "gear_ratio": 18.524,
+      "counts_per_degree": 210.76,
+      "counts_per_metre": 201265.2,
+      "direction": -1
+    },
+    "RIGHT": {
+      "readings": 5,
+      "counts_per_wheel_rev": 75557.2,
+      "gear_ratio": 18.447,
+      "counts_per_degree": 209.88,
+      "counts_per_metre": 200421.7,
+      "direction": 1
+    }
+  },
+  "combined": {
+    "counts_per_wheel_rev": 75849.7,
+    "gear_ratio": 18.518,
+    "counts_per_degree": 210.694,
+    "counts_per_metre": 201197.7
+  },
+  "duty_to_counts_per_sec": {
+    "slope": 959.0,
+    "intercept": -47316.0,
+    "valid_duty_min": 58,
+    "note": "counts_per_sec = slope*duty + intercept"
+  },
+  "deadband_duty": {
+    "no_motion_at_or_below": 45,
+    "creeps_at": 50,
+    "clean_at": 60
+  },
+  "track_width_m": null,
+  "track_width_note": "UNMEASURED. Wheel centre-to-centre separation. Needed for heading and turning; straight-line distance is unaffected. Measure it and set it before trusting odometry yaw.",
+  "encoder_sign": -1,
+  "encoder_sign_note": "RPWM (forward) makes the counters run negative.",
+  "direction_note": "Per wheel: which way the motor turns for a positive command, relative to the bot's forward. The two motors are mounted mirror-imaged, so wiring both the same makes one run backwards. -1 flips both the duty sent and the counts read for that wheel, so forward is forward on both sides everywhere above the driver. Verify with motor_tui.py: press w, both wheels roll forward and both angles climb.",
+  "measured_gear_ratio_history": [
+    {
+      "ratio": 18.518,
+      "replaced": "2026-08-26 17:52:44"
+    }
+  ],
+  "gear_ratio_note": "Measured with gear_check.py by driving the wheel a whole number of revolutions under power and reading the tyre mark. This supersedes the per-wheel hand-turned figures, which are biased low by gearbox backlash. ONE ratio applies to both wheels -- they share a gearbox design, so a per-wheel difference is measurement error, and baking it in makes the car curve."
+}
