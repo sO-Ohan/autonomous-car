@@ -21,6 +21,7 @@ import sys
 import time
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from carbot.driver import DEFAULT_PORT  # honours CARBOT_PORT
 from carbot.driver import WheelDriver, MODE_NAME   # noqa: E402
 
 CLR = "\033[2J\033[H"
@@ -87,7 +88,7 @@ def render(st, cmd, elapsed):
 
 def main():
     ap = argparse.ArgumentParser(description="Live wheel odometry readout.")
-    ap.add_argument("port", nargs="?", default="/dev/ttyACM0")
+    ap.add_argument("port", nargs="?", default=DEFAULT_PORT)
     ap.add_argument("--drive", type=float, metavar="MPS",
                     help="closed-loop velocity, both wheels, m/s")
     ap.add_argument("--distance", type=float, metavar="M",

@@ -31,6 +31,7 @@ import argparse
 import sys
 import time
 
+from carbot.driver import DEFAULT_PORT  # honours CARBOT_PORT
 from carbot.driver import LEFT, RIGHT, MODE_HOLD, WheelDriver
 
 MIN_DUTY, MAX_DUTY = 58, 255      # 58 is just above the measured deadband
@@ -195,7 +196,7 @@ def menu(bot: WheelDriver) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Hold position, or rotate a wheel by degrees.")
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default=DEFAULT_PORT)
     ap.add_argument("--duty", type=int, default=90,
                     help=f"rotate duty, {MIN_DUTY}-{MAX_DUTY} (default 90)")
     sub = ap.add_subparsers(dest="cmd")

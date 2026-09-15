@@ -28,6 +28,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from carbot.driver import DEFAULT_PORT  # honours CARBOT_PORT
 from carbot import (CRITICAL, LEFT, OPTIONAL, MotorConfig, MotorNode,
                     PROPERTIES, RIGHT, WheelDriver)
 
@@ -476,7 +477,7 @@ class MotorTUI:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default=DEFAULT_PORT)
     ap.add_argument("--track-width", type=float, default=None,
                     help="wheel centre-to-centre in metres, for body pose")
     ap.add_argument("--no-hold", action="store_true",

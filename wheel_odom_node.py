@@ -25,6 +25,7 @@ import argparse
 import sys
 import time
 
+from carbot.driver import DEFAULT_PORT  # honours CARBOT_PORT
 from carbot import WheelDriver
 from carbot.odometry import WheelOdometryNode
 
@@ -32,7 +33,7 @@ from carbot.odometry import WheelOdometryNode
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("port", nargs="?", default="/dev/ttyACM0")
+    ap.add_argument("port", nargs="?", default=DEFAULT_PORT)
     ap.add_argument("--rate", type=float, default=20.0, help="sample rate, Hz")
     ap.add_argument("--track-width", type=float, default=None,
                     help="wheel separation in metres; enables body pose")
