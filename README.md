@@ -295,6 +295,17 @@ Note that a move opposite to the approach direction shows ~8° of apparent
 overshoot in `analyze_moves.py`. That is the planned `TAKEUP` run-past, not a
 control fault.
 
+## Sensors
+
+The perception side lives on the car computer, not the ESP32: a Slamtec
+RPLIDAR (CP2102, 256000 baud, ~16.5k points/s) and a WitMotion IMU (CH340,
+115200). `sensors/lidar_web.py` is a stdlib-only web GUI with a live polar
+plot, start/stop, port/baud config, the IMU readout and a JSON API.
+
+Full bring-up notes, port identification, the SDK build and the one trap
+(this firmware ignores the legacy `SCAN` command) are in
+[`docs/LIDAR.md`](docs/LIDAR.md).
+
 ## Logs
 
 `drive_tui.py` writes every line sent and received to

@@ -1,0 +1,14 @@
+[Unit]
+Description=Car lidar web GUI (lidar_web.py)
+After=network.target
+
+[Service]
+# adjust the path to where the repo lives on the car computer
+WorkingDirectory=/home/mt10/autonomus car
+ExecStart=/usr/bin/python3 /home/mt10/autonomus\x20car/lidar_web.py --autostart
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target
