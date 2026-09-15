@@ -63,8 +63,9 @@ eth: W5500 up, STATIC (no DHCP answer) 192.168.1.77, link UP
 eth: console on tcp/3333, firmware push on tcp/3232
 ```
 
-`STATIC (no DHCP answer)` is correct here — there is no DHCP server on this
-segment, so the car settles on its fallback address after a 6 s wait.
+That was the original DHCP-first firmware. Since 2026-09-15 the address is
+**always static** and the first line reads `eth: MAC ..., static 192.168.1.77`
+(see [Addressing](#addressing-always-static) below).
 
 From then on the USB cable is optional. Verify with `ping 192.168.1.77`.
 
@@ -122,7 +123,7 @@ New console command:
 
 ```
 C
-# eth: started, DHCP, ip 192.168.1.77, link UP
+# eth: started, static, ip 192.168.1.77, link UP
 # eth: MAC 02:..., console CONNECTED, ports 3333/3232
 # eth: tx 184320 bytes in 152 packets (1212.6 B/pkt), 3 OTA(s) served
 # eth: running image from partition 'app1'
@@ -216,10 +217,14 @@ Being precise about this, because the difference matters.
   MAC (`...:2C`), so bringing the radio up with `A 1` cannot collide.
 
 **Known, and expected:**
-- **There is no DHCP server on this segment.** The board waits 6 s, gets no
-  answer, and settles on the static **192.168.1.77/24, gateway .1**. That is
-  why the address is stable and why it appears throughout this document. `C`
-  reports `static` rather than `DHCP` — that is correct, not a fault.
+- <a id="addressing-always-static"></a>**The address is always static:
+  192.168.1.77/24, gateway .1.** The firmware used to try DHCP first and only
+  fall back to .77 when nobody answered. On 2026-09-15 a second router on the
+  bench switch (`172.19.23.1`) answered, the car came up at `172.19.23.64`, and
+  .77 was dead from both the laptop and `mt10` while the link itself was fine.
+  DHCP was removed: every host on the SLAMBOT network is static (`NETWORK.md`),
+  and the car's address must not depend on which router happens to be plugged
+  in. `C` reports `static`.
 - If you ever move the car to a segment where SPI is marginal, `ethBegin()`
   will say `NO HARDWARE at 14 MHz` while `Y` still says `PRESENT`. That means
   the leads are too long or too noisy for the library clock: shorten them, or
@@ -269,10 +274,9 @@ applies to *reading* too.
 |---|---|---|
 | Board silent, `waiting for download` seen once | DTR/RTS was toggled | Unplug and replug USB — software reset will not clear it |
 | Boot says `NO HARDWARE at 14 MHz`, `Y` says `PRESENT` | SPI marginal at the library's clock | Shorten leads, or lower `SPI_ETHERNET_SETTINGS` |
-| `C` says `static` not `DHCP` | no DHCP server on this segment | Expected. The car is at 192.168.1.77 |
 | `link DOWN` | cable / switch / Bullet port | Check the switch LEDs first |
 | Board reachable, console silent | another console holds the socket | Second connection gets `# busy`; drop the first |
-| `ota_push.py` cannot connect | wrong IP, or DHCP moved it | Plug USB, run `C`, read the real IP |
+| `ota_push.py` cannot connect / .77 dead but link UP | old DHCP-first firmware took an address from another router | Plug USB, run `C`, read the real IP; flash current firmware (always static) |
 | OTA reports `ERR md5 mismatch` | corrupted transfer | Old image still runs; just retry |
 | Car reachable but drives late | Nagle | Confirm the host sets `TCP_NODELAY` |
 

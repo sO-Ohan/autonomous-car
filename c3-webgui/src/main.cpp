@@ -2187,16 +2187,17 @@ static void ethBegin() {
   esp_read_mac(netMac, ESP_MAC_ETH);
   Ethernet.init(PIN_ETH_CS);
 
-  Serial.printf("eth: MAC %02X:%02X:%02X:%02X:%02X:%02X, trying DHCP...\n",
+  Serial.printf("eth: MAC %02X:%02X:%02X:%02X:%02X:%02X, static 192.168.1.77\n",
                 netMac[0], netMac[1], netMac[2],
                 netMac[3], netMac[4], netMac[5]);
 
-  // Short timeouts: this runs in setup() and must not hold the car hostage.
-  netGotDhcp = (Ethernet.begin(netMac, 6000, 3000) == 1);
-  if (!netGotDhcp) {
-    Ethernet.begin(netMac, netFallbackIp, netFallbackGw,
-                   netFallbackGw, netFallbackSn);
-  }
+  // Always static. DHCP-first let any router on the segment decide the car's
+  // address: on the bench a second router answered and the car came up at
+  // 172.19.23.64, unreachable from everything configured for 192.168.1.77.
+  // Every host on the SLAMBOT network is static (see NETWORK.md), so is this.
+  netGotDhcp = false;
+  Ethernet.begin(netMac, netFallbackIp, netFallbackGw,
+                 netFallbackGw, netFallbackSn);
 
   // hardwareStatus() answering W5500 is also the proof that the SPI bus is
   // sound at the Ethernet library's clock (14 MHz), which is faster than the
